@@ -1,0 +1,1583 @@
+import sys
+import re
+import csv
+
+# ============================================================
+# PYTHON / DEPENDENCY COMPATIBILITY
+# Target environment: CPython 3.12.x (tested design target: 3.12.9)
+# ============================================================
+
+if sys.version_info < (3, 12):
+    raise RuntimeError(
+        f"This script targets Python 3.12 or newer; found {sys.version.split()[0]}."
+    )
+
+try:
+    import numpy as np
+except ImportError as exc:
+    raise RuntimeError(
+        "NumPy is required. Install it with: python -m pip install numpy"
+    ) from exc
+
+try:
+    import pyvista as pv
+except ImportError as exc:
+    raise RuntimeError(
+        "PyVista is required. Install it with: python -m pip install pyvista"
+    ) from exc
+
+try:
+    import pyacvd
+except ImportError as exc:
+    raise RuntimeError(
+        "pyacvd is required for the uniform-remeshing step. "
+        "Install it with: python -m pip install pyacvd"
+    ) from exc
+
+try:
+    import trimesh
+except ImportError as exc:
+    raise RuntimeError(
+        "trimesh is required. Install it with: python -m pip install trimesh"
+    ) from exc
+
+try:
+    from manifold3d import Manifold, Mesh as ManifoldMesh
+except ImportError as exc:
+    raise RuntimeError(
+        "manifold3d is required. Install it with: python -m pip install manifold3d"
+    ) from exc
+
+
+# ============================================================
+# INPUTS
+# ============================================================
+
+BASE_VTP = r"Healthy_Model.vtp"
+
+TOOL_VTPS = [
+   r"Clot_Proximal_RPA_Remeshed.vtp",
+   r"Clot_Proximal_LPA_Remeshed.vtp"
+
+]
+
+OLD_FACENAMES = r"Healthy_Model.vtp.facenames"
+
+OUTPUT_VTP = r"JL_Auto_ClotsSubtracted_OpenWall.vtp"
+
+OUTPUT_FACENAMES = (
+    r"JL_Auto_ClotsSubtracted_OpenWall.vtp.facenames"
+)
+
+CAP_REFERENCE_CSV = r"JL_Auto_ClotsSubtracted_OpenWall_cap_reference.csv"
+
+# All triangles remaining in the exported open surface are vessel wall.
+# Keeping the historical wall ID avoids changing downstream conventions.
+OPEN_WALL_FACE_ID = 103
+
+# ============================================================
+# TUNING
+# ============================================================
+
+CAP_PERCENTILE = 99
+
+# thickness allowed around cap plane
+# increase slightly if caps miss triangles
+PLANE_TOL_FACTOR = 0.005
+
+# ----------------------------
+# Wall remeshing + export for SimVascular capping
+# ----------------------------
+# IMPORTANT: This version deliberately throws away every old cap triangle.
+# The boolean result is opened at all stored cap planes, the OPEN wall is
+# remeshed and validated, and the clean open surface is exported for capping
+# inside SimVascular. No external cap triangulation is performed.
+REBUILD_CAPS_FROM_SCRATCH = True
+ENABLE_UNIFORM_REMESH = True
+
+# If None, use the median edge length of the original base surface.
+REMESH_TARGET_EDGE_LENGTH = None
+REMESH_EDGE_MULTIPLIER = 1.0
+REMESH_MIN_CLUSTERS = 25_000
+REMESH_MAX_CLUSTERS = 300_000
+REMESH_SUBDIVIDE = 0
+
+# Identifying/removing old cap triangles from the closed boolean result.
+# A triangle must be close to a stored cap plane AND have a normal roughly
+# parallel to that plane normal, which prevents removal of the adjacent wall.
+# Legacy-cap removal now uses edge-connected planar region growing.
+# These control how strictly a triangle must match the original cap plane.
+CAP_GROW_MIN_NORMAL_ALIGNMENT = 0.985
+CAP_GROW_PLANE_TOL_FACTOR = 3.0
+CAP_GROW_PLANE_TOL_EDGE_MULTIPLIER = 0.20
+CAP_GROW_SEED_SEARCH_RADIUS_SCALE = 0.60
+CAP_GROW_MIN_TRIANGLES = 3
+
+# Boundary-loop to original-cap matching.  The score combines distance of the
+# loop centroid from the original cap center and distance from its plane.
+CAP_MATCH_MAX_SCORE = 4.0
+
+# Snap each remeshed open boundary back onto its original cap plane before
+# creating the new cap.  This makes the cap exactly planar while retaining
+# the wall/cap shared vertices, so there is no seam or duplicate boundary.
+SNAP_BOUNDARIES_TO_ORIGINAL_PLANES = True
+
+# Optional diagnostics for ParaView.
+WRITE_DEBUG_SURFACES = True
+DEBUG_PRE_REMESH_VTP = r"JL_debug_pre_remesh.vtp"
+DEBUG_OPEN_WALL_VTP = r"JL_debug_open_wall.vtp"
+DEBUG_REMESHED_OPEN_WALL_VTP = r"JL_debug_remeshed_open_wall.vtp"
+DEBUG_REBUILT_CAPS_VTP = r"JL_debug_rebuilt_caps.vtp"
+
+
+# ============================================================
+# FACENAME I/O
+# ============================================================
+
+def read_facenames(fname):
+
+    faces = {}
+
+    pattern = re.compile(
+        r"set\s+gPolyDataFaceNames\((\d+)\)\s+(\S+)"
+    )
+
+    with open(fname) as f:
+
+        for line in f:
+
+            m = pattern.match(line.strip())
+
+            if m:
+
+                fid = int(m.group(1))
+
+                name = m.group(2).strip().strip("{}")
+
+                faces[fid] = name
+
+    return faces
+
+
+def write_facenames(path, assignments):
+
+    with open(path, "w") as f:
+
+        f.write("global gPolyDataFaceNames\n\n")
+
+        for fid in sorted(assignments):
+
+            f.write(
+                f"set gPolyDataFaceNames({fid}) "
+                f"{assignments[fid]}\n"
+            )
+
+
+# ============================================================
+# SURFACE LOADING
+# ============================================================
+
+def load_surface(path):
+
+    mesh = pv.read(path)
+
+    if not isinstance(mesh, pv.PolyData):
+
+        mesh = mesh.extract_surface()
+
+    return mesh
+
+
+# ============================================================
+# CONVERSIONS
+# ============================================================
+
+def pv_to_tm(pv_mesh):
+
+    tri = pv_mesh.triangulate()
+
+    verts = np.array(tri.points)
+
+    faces = tri.faces.reshape(-1, 4)[:, 1:]
+
+    return trimesh.Trimesh(
+        vertices=verts,
+        faces=faces,
+        process=False,
+    )
+
+
+def tm_to_manifold(tm):
+    """Convert a Trimesh mesh to manifold3d using contiguous arrays.
+
+    manifold3d's Python bindings expect C-contiguous numeric arrays.
+    Explicitly creating them here avoids dtype/stride issues that can
+    otherwise appear with newer NumPy / nanobind builds on Python 3.12.
+    """
+
+    vertices = np.ascontiguousarray(tm.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(tm.faces, dtype=np.uint32)
+
+    return Manifold(
+        ManifoldMesh(
+            vert_properties=vertices,
+            tri_verts=faces,
+        )
+    )
+
+
+def manifold_to_tm(mf):
+    """Convert manifold3d output back to Trimesh with owned NumPy arrays."""
+
+    m = mf.to_mesh()
+
+    # copy=True is intentional: nanobind may expose views whose lifetime
+    # is tied to the manifold mesh object.  Owning the arrays here is safer
+    # across current Python 3.12 / manifold3d releases.
+    vertices = np.array(m.vert_properties, dtype=np.float64, copy=True)
+    faces = np.array(m.tri_verts, dtype=np.int64, copy=True)
+
+    return trimesh.Trimesh(
+        vertices=vertices,
+        faces=faces,
+        process=False,
+    )
+
+
+def tm_to_pv(tm):
+
+    n = len(tm.faces)
+
+    faces = np.hstack([
+        np.full((n, 1), 3, dtype=np.int64),
+        np.asarray(tm.faces, dtype=np.int64)
+    ]).ravel()
+
+    points = np.asarray(tm.vertices, dtype=np.float64)
+    return pv.PolyData(points, faces)
+
+
+# ============================================================
+# VECTORIZED NON-MANIFOLD FACE STRIPPING
+#
+# Replaces the original Python-loop _strip_nonmanifold_faces.
+# For a mesh with F faces, the old loop visited 3*F Python
+# iterations per iteration of the outer loop.  At 10-20x mesh
+# scale (millions of faces) that becomes seconds per pass.
+#
+# Strategy: encode each undirected edge as a single uint64
+#   key = min_v * (max_vertex_index + 1) + max_v
+# then use np.unique(..., return_counts=True) to count edge
+# valence in one vectorised call.  Edge-to-face membership is
+# resolved with another unique call rather than a Python dict,
+# cutting both time and peak memory.
+# ============================================================
+
+def _strip_nonmanifold_faces_vectorized(tm):
+    """
+    Iteratively remove faces that own a non-manifold edge
+    (valence > 2) using fully vectorised numpy operations.
+
+    Peak extra memory: ~5 * F * 8 bytes (three edge columns +
+    face indices + counts) — a small constant factor over the
+    mesh itself, so it scales to large meshes without OOM.
+    """
+
+    for iteration in range(10):  # safety cap
+
+        faces = tm.faces                         # (F, 3)  int32/64
+        nf = len(faces)
+
+        # -------------------------------------------------
+        # Build one sorted edge per face-edge slot.
+        # Columns: [min_v, max_v] for each of the 3 edges.
+        # Shape: (3*F, 2)
+        # -------------------------------------------------
+        e0 = np.stack([faces[:, 0], faces[:, 1]], axis=1)
+        e1 = np.stack([faces[:, 1], faces[:, 2]], axis=1)
+        e2 = np.stack([faces[:, 2], faces[:, 0]], axis=1)
+
+        all_edges = np.concatenate([e0, e1, e2], axis=0)   # (3F, 2)
+        all_edges.sort(axis=1)                              # sort each row in-place
+
+        # face index for each edge slot: [0..F-1, 0..F-1, 0..F-1]
+        face_of_edge = np.tile(np.arange(nf, dtype=np.int64), 3)  # (3F,)
+
+        # -------------------------------------------------
+        # Encode edges as uint64 scalars for fast unique.
+        # Using int64 arithmetic avoids overflow for meshes
+        # up to ~3 billion vertices (safe for any real case).
+        # -------------------------------------------------
+        stride = int(all_edges.max()) + 1
+        edge_keys = all_edges[:, 0].astype(np.int64) * stride + all_edges[:, 1].astype(np.int64)
+
+        # unique edge keys + where each slot maps to in the unique list
+        unique_keys, inv_idx, counts = np.unique(
+            edge_keys, return_inverse=True, return_counts=True
+        )
+
+        # valence of the edge that each slot belongs to
+        slot_valence = counts[inv_idx]                       # (3F,)
+
+        # slots whose edge is non-manifold (valence > 2)
+        bad_slots = slot_valence > 2
+
+        if not bad_slots.any():
+            break
+
+        n_bad_edges = int((counts > 2).sum())
+        print(
+            f"  [repair] iteration {iteration + 1}: "
+            f"removing {n_bad_edges} non-manifold edges "
+            f"(vectorised)"
+        )
+
+        # faces that own at least one bad slot
+        bad_face_mask = np.zeros(nf, dtype=bool)
+        bad_face_mask[face_of_edge[bad_slots]] = True
+
+        if not bad_face_mask.any():
+            break
+
+        # rebuild mesh without bad faces
+        tm = trimesh.Trimesh(
+            vertices=tm.vertices,
+            faces=faces[~bad_face_mask],
+            process=False,
+        )
+
+        tm.remove_unreferenced_vertices()
+
+        # release temporary arrays immediately
+        del e0, e1, e2, all_edges, edge_keys
+        del unique_keys, inv_idx, counts, slot_valence, bad_slots, face_of_edge, bad_face_mask
+
+    return tm
+
+
+# ============================================================
+# SINGLE-REGION ENFORCEMENT
+#
+# After the boolean pipeline the mesh must contain exactly one
+# connected region before it enters SimVascular meshing.
+# Multiple disconnected shells cause:
+#   - Duplicated facet / face-intersection errors in BL mesher
+#   - Ambiguous ModelFaceID assignment
+#   - Non-manifold junctions at boolean seams
+#
+# We enforce this at TWO points:
+#   1. Inside repair(), on the trimesh level (existing step 8,
+#      now kept but using the improved strip call above).
+#   2. After the final boolean, on the manifold3d level, via
+#      Manifold.decompose() — much cheaper than a trimesh
+#      round-trip because it never leaves the Manifold domain.
+# ============================================================
+
+def enforce_single_region_manifold(mf, label=""):
+    """
+    Given a Manifold, decompose it into connected components,
+    keep only the largest by triangle count, and return it.
+
+    Operates entirely within manifold3d — no trimesh or numpy
+    round-trip — so it is fast even for very large meshes.
+    """
+
+    components = mf.decompose()
+
+    if len(components) == 1:
+        print(f"  [single-region {label}] mesh already has 1 component — OK")
+        return mf
+
+    # pick the largest component by triangle count
+    sizes = [c.num_tri() for c in components]
+    best_idx = int(np.argmax(sizes))
+    best = components[best_idx]
+
+    discarded_tris = sum(sizes) - sizes[best_idx]
+    print(
+        f"  [single-region {label}] "
+        f"{len(components)} components found — "
+        f"kept component #{best_idx + 1} "
+        f"({sizes[best_idx]} tris), "
+        f"discarded {discarded_tris} tris across "
+        f"{len(components) - 1} smaller component(s)"
+    )
+
+    return best
+
+
+# ============================================================
+# HARDENED REPAIR
+# ============================================================
+
+def repair(tm):
+
+    # --------------------------------------------------------
+    # Step 1: Drop degenerate (zero-area) faces
+    # --------------------------------------------------------
+    nondeg_mask = tm.nondegenerate_faces()
+    tm = trimesh.Trimesh(
+        vertices=tm.vertices,
+        faces=tm.faces[nondeg_mask],
+        process=False,
+    )
+    del nondeg_mask
+
+    # --------------------------------------------------------
+    # Step 2: Merge vertices that are truly identical
+    # --------------------------------------------------------
+    try:
+        tm.merge_vertices(merge_tex=False, merge_norm=False)
+    except TypeError:
+        tm.merge_vertices()
+
+    # --------------------------------------------------------
+    # Step 3: Remove duplicate faces via numpy unique
+    # --------------------------------------------------------
+    sorted_faces = np.sort(tm.faces, axis=1)
+    _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
+    tm = trimesh.Trimesh(
+        vertices=tm.vertices,
+        faces=tm.faces[unique_idx],
+        process=False,
+    )
+    del sorted_faces, unique_idx
+
+    # --------------------------------------------------------
+    # Step 4: Remove unreferenced vertices
+    # --------------------------------------------------------
+    tm.remove_unreferenced_vertices()
+
+    # --------------------------------------------------------
+    # Step 5: Fix winding / normals
+    # --------------------------------------------------------
+    trimesh.repair.fix_normals(tm)
+
+    # --------------------------------------------------------
+    # Step 6: Fill holes
+    # --------------------------------------------------------
+    trimesh.repair.fill_holes(tm)
+
+    # --------------------------------------------------------
+    # Step 7: Remove non-manifold faces (VECTORISED — O(F log F)
+    # instead of O(F) Python iterations)
+    # --------------------------------------------------------
+    tm = _strip_nonmanifold_faces_vectorized(tm)
+
+    # --------------------------------------------------------
+    # Step 8: Keep only the largest connected component.
+    # This is the trimesh-level single-region enforcement;
+    # a separate manifold-level check is applied later.
+    # --------------------------------------------------------
+    components = tm.split(only_watertight=False)
+
+    if len(components) > 1:
+
+        tm = max(components, key=lambda c: len(c.faces))
+
+        print(
+            f"  [repair] kept largest component "
+            f"({len(tm.faces)} / total faces)"
+        )
+
+    del components
+
+    # --------------------------------------------------------
+    # Step 9: Final normal pass + hole fill
+    # --------------------------------------------------------
+    trimesh.repair.fix_normals(tm)
+
+    trimesh.repair.fill_holes(tm)
+
+    # --------------------------------------------------------
+    # Step 10: Report
+    # --------------------------------------------------------
+    _report_mesh_quality(tm, label="after repair")
+
+    return tm
+
+
+def _report_mesh_quality(tm, label=""):
+
+    edges = tm.edges_sorted
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+
+    nm_edges   = int((counts > 2).sum())
+    open_edges = int((counts == 1).sum())
+
+    print(
+        f"  [mesh quality {label}] "
+        f"faces={len(tm.faces)} | "
+        f"verts={len(tm.vertices)} | "
+        f"non-manifold edges={nm_edges} | "
+        f"open/boundary edges={open_edges} | "
+        f"watertight={tm.is_watertight}"
+    )
+
+
+# ============================================================
+# SURFACE QUALITY / UNIFORM REMESHING
+# ============================================================
+
+def mesh_edge_statistics(tm):
+    """Return unique edge-length statistics for a Trimesh surface."""
+
+    if len(tm.faces) == 0:
+        raise RuntimeError("Cannot measure an empty mesh.")
+
+    edges = np.asarray(tm.edges_unique, dtype=np.int64)
+    verts = np.asarray(tm.vertices, dtype=np.float64)
+    lengths = np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1)
+
+    if len(lengths) == 0:
+        raise RuntimeError("Mesh contains no measurable edges.")
+
+    return {
+        "min": float(np.min(lengths)),
+        "p01": float(np.percentile(lengths, 1)),
+        "p05": float(np.percentile(lengths, 5)),
+        "median": float(np.median(lengths)),
+        "p95": float(np.percentile(lengths, 95)),
+        "p99": float(np.percentile(lengths, 99)),
+        "max": float(np.max(lengths)),
+    }
+
+
+def triangle_quality_values(tm):
+    """Return a normalized triangle quality in [0, 1].
+
+    q = 4*sqrt(3)*A / (a^2+b^2+c^2)
+    q = 1 for an equilateral triangle and approaches 0 for a sliver.
+    """
+
+    v = np.asarray(tm.vertices, dtype=np.float64)
+    f = np.asarray(tm.faces, dtype=np.int64)
+
+    p0 = v[f[:, 0]]
+    p1 = v[f[:, 1]]
+    p2 = v[f[:, 2]]
+
+    a2 = np.einsum("ij,ij->i", p1 - p0, p1 - p0)
+    b2 = np.einsum("ij,ij->i", p2 - p1, p2 - p1)
+    c2 = np.einsum("ij,ij->i", p0 - p2, p0 - p2)
+
+    twice_area = np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+    denom = a2 + b2 + c2
+
+    q = np.zeros(len(f), dtype=np.float64)
+    valid = denom > np.finfo(float).eps
+    q[valid] = 2.0 * np.sqrt(3.0) * twice_area[valid] / denom[valid]
+    return np.clip(q, 0.0, 1.0)
+
+
+def report_surface_discretization(tm, label=""):
+    """Print metrics that are particularly relevant to TetGen robustness."""
+
+    edge = mesh_edge_statistics(tm)
+    q = triangle_quality_values(tm)
+
+    print(f"  [surface discretization {label}]")
+    print(
+        "    edges: "
+        f"min={edge['min']:.6g} | "
+        f"p01={edge['p01']:.6g} | "
+        f"p05={edge['p05']:.6g} | "
+        f"median={edge['median']:.6g} | "
+        f"p95={edge['p95']:.6g} | "
+        f"max={edge['max']:.6g}"
+    )
+    print(
+        "    triangle quality: "
+        f"min={float(np.min(q)):.6g} | "
+        f"p01={float(np.percentile(q, 1)):.6g} | "
+        f"median={float(np.median(q)):.6g} | "
+        f"q<0.05={int(np.sum(q < 0.05))} | "
+        f"q<0.10={int(np.sum(q < 0.10))}"
+    )
+
+    return edge, q
+
+
+def estimate_acvd_clusters(pv_mesh, target_edge_length):
+    """Estimate ACVD vertex clusters from area and desired edge length.
+
+    For an approximately equilateral triangulation:
+        triangle_area ~= sqrt(3)/4 * h^2
+        number_of_vertices ~= number_of_triangles / 2
+    for a large closed triangular surface.
+    """
+
+    if target_edge_length <= 0:
+        raise ValueError("target_edge_length must be > 0")
+
+    tri = pv_mesh.triangulate()
+    total_area = float(tri.area)
+
+    ideal_tri_area = (np.sqrt(3.0) / 4.0) * target_edge_length**2
+    target_triangles = max(4.0, total_area / ideal_tri_area)
+    target_vertices = int(round(target_triangles / 2.0))
+
+    target_vertices = max(REMESH_MIN_CLUSTERS, target_vertices)
+    target_vertices = min(REMESH_MAX_CLUSTERS, target_vertices)
+
+    # ACVD cannot create more clusters than there are input points unless
+    # the surface is explicitly subdivided first. Keep the request valid
+    # when REMESH_SUBDIVIDE == 0.
+    if REMESH_SUBDIVIDE == 0:
+        target_vertices = min(target_vertices, max(4, tri.n_points - 1))
+
+    return target_vertices
+
+
+def repair_open_surface(tm):
+    """Repair an OPEN surface without filling its intended cap holes."""
+
+    nondeg_mask = tm.nondegenerate_faces()
+    tm = trimesh.Trimesh(
+        vertices=tm.vertices,
+        faces=tm.faces[nondeg_mask],
+        process=False,
+    )
+
+    try:
+        tm.merge_vertices(merge_tex=False, merge_norm=False)
+    except TypeError:
+        tm.merge_vertices()
+
+    sorted_faces = np.sort(tm.faces, axis=1)
+    _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
+    tm = trimesh.Trimesh(
+        vertices=tm.vertices,
+        faces=tm.faces[unique_idx],
+        process=False,
+    )
+
+    tm.remove_unreferenced_vertices()
+    trimesh.repair.fix_normals(tm)
+    tm = _strip_nonmanifold_faces_vectorized(tm)
+    tm.remove_unreferenced_vertices()
+    trimesh.repair.fix_normals(tm)
+    _report_mesh_quality(tm, label="open-surface repair")
+    return tm
+
+
+def _build_face_adjacency_lists(faces):
+    """Build edge-neighbor lists for triangular faces using numpy only."""
+
+    faces = np.asarray(faces, dtype=np.int64)
+    nf = len(faces)
+
+    e0 = faces[:, [0, 1]]
+    e1 = faces[:, [1, 2]]
+    e2 = faces[:, [2, 0]]
+    edges = np.vstack((e0, e1, e2))
+    edges_sorted = np.sort(edges, axis=1)
+    face_ids = np.tile(np.arange(nf, dtype=np.int64), 3)
+
+    # Sort edge rows lexicographically so equal edges are consecutive.
+    order = np.lexsort((edges_sorted[:, 1], edges_sorted[:, 0]))
+    es = edges_sorted[order]
+    fs = face_ids[order]
+
+    neighbors = [[] for _ in range(nf)]
+    i = 0
+    while i < len(es):
+        j = i + 1
+        while j < len(es) and np.array_equal(es[j], es[i]):
+            j += 1
+
+        owners = fs[i:j]
+        if len(owners) == 2:
+            a, b = int(owners[0]), int(owners[1])
+            neighbors[a].append(b)
+            neighbors[b].append(a)
+        # Non-manifold (>2 owners) should already have been removed by repair().
+        i = j
+
+    return neighbors
+
+
+def strip_all_caps(tm, caps, target_edge_length):
+    """Delete legacy caps by edge-connected planar region growing.
+
+    For each original cap, a seed triangle is chosen near the stored cap
+    centroid.  The cap is then grown ONLY through edge-adjacent triangles
+    that remain close to the original cap plane and whose normals are
+    strongly aligned with the original cap normal.  This avoids accidentally
+    cutting curved vessel-wall triangles merely because they lie inside the
+    cap's radial footprint.
+    """
+
+    v = np.asarray(tm.vertices, dtype=np.float64)
+    f = np.asarray(tm.faces, dtype=np.int64)
+    p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    centroids = (p0 + p1 + p2) / 3.0
+
+    raw_normals = np.cross(p1 - p0, p2 - p0)
+    norm_mag = np.linalg.norm(raw_normals, axis=1)
+    normals = np.zeros_like(raw_normals)
+    valid = norm_mag > np.finfo(float).eps
+    normals[valid] = raw_normals[valid] / norm_mag[valid, None]
+
+    print("  Building face adjacency for planar region growing...")
+    neighbors = _build_face_adjacency_lists(f)
+
+    remove = np.zeros(len(f), dtype=bool)
+
+    for cap in caps:
+        c = np.asarray(cap["centroid"], dtype=np.float64)
+        n = np.asarray(cap["normal"], dtype=np.float64)
+        n /= np.linalg.norm(n)
+
+        vec = centroids - c
+        signed = vec @ n
+        alignment = np.abs(normals @ n)
+
+        # Keep this much tighter than the previous radius-based deletion.
+        plane_tol = max(
+            CAP_GROW_PLANE_TOL_FACTOR * float(cap["plane_tol"]),
+            CAP_GROW_PLANE_TOL_EDGE_MULTIPLIER * target_edge_length,
+        )
+
+        acceptable = (
+            (~remove)
+            & (np.abs(signed) <= plane_tol)
+            & (alignment >= CAP_GROW_MIN_NORMAL_ALIGNMENT)
+        )
+
+        # Seed selection: among acceptable faces reasonably close to the
+        # original cap center, choose the centroid-nearest triangle.
+        euclid = np.linalg.norm(vec, axis=1)
+        seed_radius = max(
+            float(cap["radius"]) * CAP_GROW_SEED_SEARCH_RADIUS_SCALE,
+            2.0 * target_edge_length,
+        )
+        seed_candidates = np.where(acceptable & (euclid <= seed_radius))[0]
+
+        if len(seed_candidates) == 0:
+            # Fallback: nearest acceptable planar/aligned face anywhere.
+            seed_candidates = np.where(acceptable)[0]
+
+        if len(seed_candidates) == 0:
+            raise RuntimeError(
+                f"Could not find a planar seed triangle for cap '{cap['name']}'. "
+                f"Try lowering CAP_GROW_MIN_NORMAL_ALIGNMENT slightly (currently "
+                f"{CAP_GROW_MIN_NORMAL_ALIGNMENT})."
+            )
+
+        seed = int(seed_candidates[np.argmin(euclid[seed_candidates])])
+
+        # Breadth-first flood fill through SHARED EDGES only.
+        stack = [seed]
+        region = []
+        visited = set()
+
+        while stack:
+            face_id = stack.pop()
+            if face_id in visited:
+                continue
+            visited.add(face_id)
+
+            if remove[face_id] or not acceptable[face_id]:
+                continue
+
+            region.append(face_id)
+            for nb in neighbors[face_id]:
+                if nb not in visited and acceptable[nb] and not remove[nb]:
+                    stack.append(nb)
+
+        if len(region) < CAP_GROW_MIN_TRIANGLES:
+            raise RuntimeError(
+                f"Planar region for cap '{cap['name']}' contained only "
+                f"{len(region)} triangles. Seed face={seed}. "
+                "The cap plane criteria are probably too strict or the cap is not planar."
+            )
+
+        region = np.asarray(region, dtype=np.int64)
+        remove[region] = True
+
+        max_plane_error = float(np.max(np.abs(signed[region])))
+        min_alignment = float(np.min(alignment[region]))
+        print(
+            f"  [remove old cap] '{cap['name']}': "
+            f"region={len(region)} triangles | seed={seed} | "
+            f"max plane error={max_plane_error:.6g} | "
+            f"min normal alignment={min_alignment:.6f}"
+        )
+
+    if not remove.any():
+        raise RuntimeError("No cap triangles were identified for removal.")
+
+    wall = trimesh.Trimesh(
+        vertices=v,
+        faces=f[~remove],
+        process=False,
+    )
+    wall.remove_unreferenced_vertices()
+    wall = repair_open_surface(wall)
+
+    # Hard validation gate: cap deletion itself must yield one simple loop
+    # per original cap before ACVD is allowed to touch the wall.
+    loops = boundary_loops_from_trimesh(wall)
+    if len(loops) != len(caps):
+        sizes = sorted((len(loop) for loop in loops), reverse=True)
+        raise RuntimeError(
+            f"Cap region-growing produced {len(loops)} simple boundary loops, "
+            f"but {len(caps)} were expected. Largest loop sizes={sizes[:10]}. "
+            "Stopping before remeshing so the source of the problem remains isolated."
+        )
+
+    print(
+        f"  [cap deletion validation] PASS: {len(loops)} simple closed "
+        "boundary loops; every boundary vertex has degree 2."
+    )
+    return wall
+
+
+def uniform_remesh_open_wall(tm, target_edge_length):
+    """Uniformly remesh the intentionally OPEN arterial wall with pyACVD."""
+
+    pv_in = tm_to_pv(tm).triangulate().clean()
+    n_clusters = estimate_acvd_clusters(pv_in, target_edge_length)
+
+    print(
+        f"  Open-wall remesh target edge ~= {target_edge_length:.6g}; "
+        f"ACVD clusters={n_clusters:,}; subdivide={REMESH_SUBDIVIDE}"
+    )
+
+    if hasattr(pv_in, "acvd") and hasattr(pv_in.acvd, "remesh"):
+        pv_out = pv_in.acvd.remesh(
+            n_clusters,
+            subdivide=REMESH_SUBDIVIDE,
+        )
+    else:
+        clus = pyacvd.Clustering(pv_in)
+        if REMESH_SUBDIVIDE > 0:
+            clus.subdivide(REMESH_SUBDIVIDE)
+        clus.cluster(n_clusters)
+        pv_out = clus.create_mesh()
+
+    pv_out = pv_out.triangulate().clean()
+    return repair_open_surface(pv_to_tm(pv_out))
+
+
+def boundary_loops_from_trimesh(tm):
+    """Return ordered vertex-index loops for every boundary component."""
+
+    faces = np.asarray(tm.faces, dtype=np.int64)
+    e0 = faces[:, [0, 1]]
+    e1 = faces[:, [1, 2]]
+    e2 = faces[:, [2, 0]]
+    edges = np.vstack((e0, e1, e2))
+    sorted_edges = np.sort(edges, axis=1)
+
+    _, inv, counts = np.unique(
+        sorted_edges, axis=0, return_inverse=True, return_counts=True
+    )
+    boundary_edges = edges[counts[inv] == 1]
+
+    if len(boundary_edges) == 0:
+        return []
+
+    adjacency = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(int(a), []).append(int(b))
+        adjacency.setdefault(int(b), []).append(int(a))
+
+    bad_degree = {k: len(v) for k, v in adjacency.items() if len(v) != 2}
+    if bad_degree:
+        sample = list(bad_degree.items())[:10]
+        raise RuntimeError(
+            "Boundary is not composed of simple closed loops. "
+            f"Found vertices with degree != 2, e.g. {sample}"
+        )
+
+    loops = []
+    unvisited = set(adjacency)
+
+    while unvisited:
+        start = next(iter(unvisited))
+        loop = [start]
+        prev = None
+        curr = start
+
+        while True:
+            nbrs = adjacency[curr]
+            nxt = nbrs[0] if nbrs[0] != prev else nbrs[1]
+            if nxt == start:
+                break
+            if nxt in loop:
+                raise RuntimeError("Encountered a self-crossing boundary loop.")
+            loop.append(nxt)
+            prev, curr = curr, nxt
+
+        for vid in loop:
+            unvisited.discard(vid)
+        loops.append(np.asarray(loop, dtype=np.int64))
+
+    loops.sort(key=len, reverse=True)
+    return loops
+
+
+def match_boundary_loops_to_caps(tm, loops, caps, target_edge_length):
+    """Match each open boundary loop uniquely to stored original cap metadata."""
+
+    pts = np.asarray(tm.vertices, dtype=np.float64)
+    candidates = []
+
+    for li, loop in enumerate(loops):
+        lc = pts[loop].mean(axis=0)
+        for ci, cap in enumerate(caps):
+            c = np.asarray(cap["centroid"], dtype=np.float64)
+            n = np.asarray(cap["normal"], dtype=np.float64)
+            n /= np.linalg.norm(n)
+            d = lc - c
+            plane = abs(float(d @ n))
+            radial = np.linalg.norm(d - (d @ n) * n)
+            radius = max(float(cap["radius"]), target_edge_length)
+            score = radial / radius + plane / max(radius, target_edge_length)
+            candidates.append((score, li, ci, radial, plane))
+
+    candidates.sort(key=lambda x: x[0])
+    used_loops = set()
+    used_caps = set()
+    matches = {}
+
+    for score, li, ci, radial, plane in candidates:
+        if li in used_loops or ci in used_caps:
+            continue
+        if score > CAP_MATCH_MAX_SCORE:
+            continue
+        matches[li] = ci
+        used_loops.add(li)
+        used_caps.add(ci)
+
+    if len(matches) != len(loops) or len(matches) != len(caps):
+        unmatched_loops = sorted(set(range(len(loops))) - set(matches))
+        unmatched_caps = [caps[i]["name"] for i in range(len(caps)) if i not in used_caps]
+        raise RuntimeError(
+            "Could not obtain a one-to-one boundary-loop/cap match. "
+            f"loops={len(loops)}, caps={len(caps)}, matches={len(matches)}, "
+            f"unmatched_loops={unmatched_loops[:10]}, "
+            f"unmatched_caps={unmatched_caps[:10]}"
+        )
+
+    for li in sorted(matches):
+        cap = caps[matches[li]]
+        print(
+            f"  [boundary match] loop {li + 1:02d} "
+            f"({len(loops[li])} verts) -> '{cap['name']}'"
+        )
+
+    return matches
+
+
+def triangulate_planar_loop_vtk(loop_points):
+    """Triangulate a planar closed contour using VTK's contour triangulator."""
+
+    try:
+        import vtk
+    except ImportError as exc:
+        raise RuntimeError(
+            "VTK is required for cap triangulation; it is normally installed "
+            "automatically with PyVista."
+        ) from exc
+
+    n = len(loop_points)
+    if n < 3:
+        raise RuntimeError("Cannot triangulate a cap with fewer than 3 points.")
+
+    vtk_pts = vtk.vtkPoints()
+    for p in loop_points:
+        vtk_pts.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+
+    lines = vtk.vtkCellArray()
+    for i in range(n):
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, i)
+        line.GetPointIds().SetId(1, (i + 1) % n)
+        lines.InsertNextCell(line)
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_pts)
+    poly.SetLines(lines)
+
+    tri_filter = vtk.vtkContourTriangulator()
+    tri_filter.SetInputData(poly)
+    tri_filter.Update()
+
+    out = pv.wrap(tri_filter.GetOutput()).triangulate()
+    if out.n_cells == 0:
+        raise RuntimeError("vtkContourTriangulator produced zero cap triangles.")
+
+    if out.n_points != n:
+        raise RuntimeError(
+            "vtkContourTriangulator unexpectedly changed the contour point count "
+            f"({n} -> {out.n_points})."
+        )
+
+    faces = out.faces.reshape(-1, 4)[:, 1:].astype(np.int64, copy=True)
+    return faces
+
+
+def rebuild_caps_from_boundary_loops(tm_wall, caps, target_edge_length):
+    """Snap open loops to original planes and generate entirely new caps.
+
+    Returns a closed PyVista PolyData with ModelFaceID already assigned.
+    """
+
+    loops = boundary_loops_from_trimesh(tm_wall)
+    print(f"Detected {len(loops)} open boundary loops; expected {len(caps)} caps")
+
+    if len(loops) != len(caps):
+        raise RuntimeError(
+            f"Expected {len(caps)} boundary loops after deleting caps, "
+            f"but found {len(loops)}. Inspect {DEBUG_REMESHED_OPEN_WALL_VTP}."
+        )
+
+    matches = match_boundary_loops_to_caps(
+        tm_wall, loops, caps, target_edge_length
+    )
+
+    vertices = np.asarray(tm_wall.vertices, dtype=np.float64).copy()
+    wall_faces = np.asarray(tm_wall.faces, dtype=np.int64).copy()
+    wall_fid = max(c["fid"] for c in caps) + 1
+
+    all_faces = [wall_faces]
+    all_ids = [np.full(len(wall_faces), wall_fid, dtype=np.int32)]
+
+    for li, loop in enumerate(loops):
+        cap = caps[matches[li]]
+        c = np.asarray(cap["centroid"], dtype=np.float64)
+        n = np.asarray(cap["normal"], dtype=np.float64)
+        n /= np.linalg.norm(n)
+
+        if SNAP_BOUNDARIES_TO_ORIGINAL_PLANES:
+            d = (vertices[loop] - c) @ n
+            vertices[loop] -= np.outer(d, n)
+
+        local_points = vertices[loop]
+        local_faces = triangulate_planar_loop_vtk(local_points)
+        global_faces = loop[local_faces]
+
+        all_faces.append(global_faces)
+        all_ids.append(np.full(len(global_faces), cap["fid"], dtype=np.int32))
+
+        # Quality report for this newly created cap.
+        cap_tm = trimesh.Trimesh(
+            vertices=vertices,
+            faces=global_faces,
+            process=False,
+        )
+        q = triangle_quality_values(cap_tm)
+        print(
+            f"  [new cap] '{cap['name']}': {len(global_faces)} tris | "
+            f"q_min={np.min(q):.5g} | q01={np.percentile(q,1):.5g}"
+        )
+
+    faces = np.vstack(all_faces)
+    face_ids = np.concatenate(all_ids)
+
+    closed_tm = trimesh.Trimesh(
+        vertices=vertices,
+        faces=faces,
+        process=False,
+    )
+    trimesh.repair.fix_normals(closed_tm)
+    _report_mesh_quality(closed_tm, label="after fresh recapping")
+    report_surface_discretization(closed_tm, label="freshly recapped")
+
+    if not closed_tm.is_watertight:
+        raise RuntimeError(
+            "Freshly recapped surface is not watertight. Inspect the debug outputs."
+        )
+
+    pv_result = tm_to_pv(closed_tm)
+    pv_result.cell_data["ModelFaceID"] = face_ids
+
+    assignments = {c["fid"]: c["name"] for c in caps}
+    assignments[wall_fid] = "wall"
+    return pv_result, assignments
+
+
+# ============================================================
+# EXTRACT PLANAR CAP INFO
+# ============================================================
+
+def extract_cap_info(
+    surface,
+    facename_file,
+    percentile=80
+):
+
+    face_map = read_facenames(facename_file)
+
+    cap_entries = {
+        fid: name
+        for fid, name in face_map.items()
+        if "wall" not in name.lower()
+    }
+
+    if "ModelFaceID" not in surface.cell_data:
+
+        raise RuntimeError(
+            "ModelFaceID missing from mesh."
+        )
+
+    mf_ids = surface.cell_data["ModelFaceID"]
+
+    caps = []
+
+    for fid, name in cap_entries.items():
+
+        cell_ids = np.where(mf_ids == fid)[0]
+
+        if len(cell_ids) == 0:
+
+            print(
+                f"WARNING: cap '{name}' has no cells"
+            )
+
+            continue
+
+        sub = surface.extract_cells(cell_ids)
+        sub_clean = sub.clean()
+        pts = np.array(sub_clean.points)
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+
+        normal = vh[-1]
+
+        normal = normal / np.linalg.norm(normal)
+
+        vec = pts - centroid
+
+        plane_component = np.outer(
+            np.dot(vec, normal),
+            normal
+        )
+
+        projected = vec - plane_component
+
+        radial_dist = np.linalg.norm(
+            projected,
+            axis=1
+        )
+
+        radius = np.percentile(
+            radial_dist,
+            percentile
+        )
+
+        plane_tol = (
+            radius * PLANE_TOL_FACTOR
+        )
+
+        caps.append({
+
+            "fid": fid,
+
+            "name": name,
+
+            "centroid": centroid,
+
+            "normal": normal,
+
+            "radius": radius,
+
+            "plane_tol": plane_tol,
+        })
+
+        print(
+            f"Cap '{name}' | "
+            f"fid={fid} | "
+            f"radius={radius:.4f} | "
+            f"plane_tol={plane_tol:.4f}"
+        )
+
+    return caps
+
+
+# ============================================================
+# PLANAR CAP ASSIGNMENT
+# ============================================================
+
+def build_assignments(
+    pv_result,
+    caps
+):
+
+    tri = pv_result.triangulate()
+
+    faces = tri.faces.reshape(-1, 4)[:, 1:]
+
+    pts = tri.points
+
+    cell_centroids = pts[faces].mean(axis=1)
+
+    face_id_array = np.zeros(
+        tri.n_cells,
+        dtype=int
+    )
+
+    for cap in caps:
+
+        centroid = cap["centroid"]
+
+        normal = cap["normal"]
+
+        radius = cap["radius"]
+
+        plane_tol = cap["plane_tol"]
+
+        vec = cell_centroids - centroid
+
+        plane_dist = np.abs(
+            np.dot(vec, normal)
+        )
+
+        projected = vec - np.outer(
+            np.dot(vec, normal),
+            normal
+        )
+
+        radial_dist = np.linalg.norm(
+            projected,
+            axis=1
+        )
+
+        mask = (
+            (plane_dist <= plane_tol) &
+            (radial_dist <= radius)
+        )
+
+        face_id_array[mask] = cap["fid"]
+
+        print(
+            f"Assigned cap '{cap['name']}' "
+            f"-> {mask.sum()} cells"
+        )
+
+    wall_fid = max(
+        c["fid"] for c in caps
+    ) + 1
+
+    wall_mask = face_id_array == 0
+
+    face_id_array[wall_mask] = wall_fid
+
+    print(
+        f"Assigned wall -> "
+        f"{wall_mask.sum()} cells"
+    )
+
+    tri.cell_data["ModelFaceID"] = face_id_array
+
+    assignments = {
+        c["fid"]: c["name"]
+        for c in caps
+    }
+
+    assignments[wall_fid] = "wall"
+
+    return tri, assignments
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+print("=" * 60)
+print(f"Python:     {sys.version.split()[0]}")
+print(f"NumPy:      {np.__version__}")
+print(f"PyVista:    {pv.__version__}")
+print(f"pyacvd:     {getattr(pyacvd, '__version__', 'installed')}")
+print(f"trimesh:    {trimesh.__version__}")
+try:
+    import manifold3d as _manifold3d
+    print(f"manifold3d: {getattr(_manifold3d, '__version__', 'installed')}")
+except Exception:
+    pass
+print("=" * 60)
+
+print("Loading base mesh...")
+
+base = load_surface(BASE_VTP)
+
+print("Extracting planar cap information...")
+
+caps = extract_cap_info(
+    base,
+    OLD_FACENAMES,
+    percentile=CAP_PERCENTILE
+)
+
+print(
+    f"Detected {len(caps)} caps"
+)
+
+# Measure the original surface before any boolean operations. This becomes
+# the default resolution target for the final uniform remesh.
+print("Measuring original base-surface resolution...")
+_base_tm_for_scale = pv_to_tm(base)
+_base_edge_stats, _ = report_surface_discretization(
+    _base_tm_for_scale,
+    label="original base",
+)
+BASE_MEDIAN_EDGE_LENGTH = _base_edge_stats["median"]
+del _base_tm_for_scale, _base_edge_stats
+
+if REMESH_TARGET_EDGE_LENGTH is None:
+    target_remesh_edge = BASE_MEDIAN_EDGE_LENGTH * REMESH_EDGE_MULTIPLIER
+else:
+    target_remesh_edge = float(REMESH_TARGET_EDGE_LENGTH)
+
+print(
+    f"Final remesh target edge length: {target_remesh_edge:.6g} "
+    f"(original median={BASE_MEDIAN_EDGE_LENGTH:.6g})"
+)
+
+# ============================================================
+# REPAIR BASE
+# ============================================================
+
+print("Preparing base mesh...")
+
+tm_base = repair(pv_to_tm(base))
+del base  # release PyVista mesh; we only need the trimesh from here on
+
+mf_base = tm_to_manifold(tm_base)
+del tm_base  # manifold3d holds its own copy; release trimesh
+
+# ============================================================
+# BOOLEAN SUBTRACTION
+# ============================================================
+
+print(
+    f"Subtracting {len(TOOL_VTPS)} tool meshes..."
+)
+
+for i, tool_path in enumerate(TOOL_VTPS):
+
+    print(
+        f"[{i+1}/{len(TOOL_VTPS)}] "
+        f"{tool_path}"
+    )
+
+    tool_pv = load_surface(tool_path)
+    tool_tm = repair(pv_to_tm(tool_pv))
+    del tool_pv
+
+    mf_tool = tm_to_manifold(tool_tm)
+    del tool_tm  # release before the boolean allocates
+
+    mf_base = mf_base - mf_tool
+    del mf_tool
+
+    if mf_base.is_empty():
+
+        sys.exit(
+            f"Boolean subtraction failed "
+            f"at tool #{i+1}"
+        )
+
+    # ----------------------------------------------------------
+    # Manifold-level single-region check after each boolean.
+    # Cheap: stays inside manifold3d, no numpy or trimesh round-
+    # trip.  Eliminates stray disconnected shells early so they
+    # don't pollute subsequent booleans or the trimesh repair.
+    # ----------------------------------------------------------
+    print(f"  Enforcing single region (manifold level) after subtraction #{i+1}...")
+    mf_base = enforce_single_region_manifold(mf_base, label=f"post-boolean-{i+1}")
+
+    # ----------------------------------------------------------
+    # Trimesh repair round-trip to fix T-junctions / slivers
+    # left by manifold3d at cut seams.
+    # ----------------------------------------------------------
+    print(f"  Repairing result after subtraction #{i+1}...")
+
+    tm_intermediate = repair(manifold_to_tm(mf_base))
+
+    mf_base = tm_to_manifold(tm_intermediate)
+    del tm_intermediate
+
+# ============================================================
+# FINAL CONVERSION + REPAIR
+# ============================================================
+
+print("Converting boolean result...")
+
+tm_result = manifold_to_tm(mf_base)
+del mf_base
+
+# ============================================================
+# FINAL SINGLE-REGION ENFORCEMENT  (trimesh level)
+#
+# This is the definitive check.  By this point the manifold-
+# level checks have already pruned stray shells, so in the
+# normal case this is a no-op.  It exists as a hard safety net
+# because the trimesh repair steps (fill_holes, fix_normals)
+# can occasionally re-introduce disconnected micro-patches.
+#
+# We use trimesh.split() rather than largest-component picking
+# so we can report exactly what was discarded.
+# ============================================================
+
+print("Enforcing single connected region (final, trimesh level)...")
+
+region_components = tm_result.split(only_watertight=False)
+
+if len(region_components) > 1:
+
+    sizes = [len(c.faces) for c in region_components]
+    best_idx = int(np.argmax(sizes))
+    tm_result = region_components[best_idx]
+    discarded = sum(sizes) - sizes[best_idx]
+
+    print(
+        f"  WARNING: {len(region_components)} disconnected regions found after repair.\n"
+        f"  Keeping largest region ({sizes[best_idx]} faces); "
+        f"discarding {discarded} faces across "
+        f"{len(region_components) - 1} smaller region(s).\n"
+        f"  If the discarded count is large, inspect the boolean inputs for gaps or overlaps."
+    )
+
+else:
+    print(f"  Single region confirmed ({len(tm_result.faces)} faces) — OK")
+
+del region_components
+
+tm_result = repair(tm_result)
+
+print("Assessing raw boolean surface before cap removal...")
+report_surface_discretization(tm_result, label="closed boolean pre-cap-removal")
+
+if WRITE_DEBUG_SURFACES:
+    print(f"Writing pre-remesh diagnostic surface: {DEBUG_PRE_REMESH_VTP}")
+    tm_to_pv(tm_result).save(DEBUG_PRE_REMESH_VTP)
+
+if not REBUILD_CAPS_FROM_SCRATCH:
+    raise RuntimeError(
+        "This script version is intended to rebuild caps from scratch. "
+        "Set REBUILD_CAPS_FROM_SCRATCH=True."
+    )
+
+print("Removing ALL legacy cap triangles...")
+tm_wall = strip_all_caps(tm_result, caps, target_remesh_edge)
+del tm_result
+
+loops_before = boundary_loops_from_trimesh(tm_wall)
+print(
+    f"Open wall after cap deletion: {len(loops_before)} boundary loops "
+    f"(expected {len(caps)})"
+)
+
+if WRITE_DEBUG_SURFACES:
+    print(f"Writing open-wall diagnostic surface: {DEBUG_OPEN_WALL_VTP}")
+    tm_to_pv(tm_wall).save(DEBUG_OPEN_WALL_VTP)
+
+if ENABLE_UNIFORM_REMESH:
+    print("Uniformly remeshing OPEN wall surface...")
+    tm_wall = uniform_remesh_open_wall(tm_wall, target_remesh_edge)
+    report_surface_discretization(tm_wall, label="remeshed open wall")
+else:
+    print("Uniform remeshing disabled; using cleaned open wall directly.")
+
+# Second hard validation gate: ACVD must preserve the 64 intended openings.
+loops_after = boundary_loops_from_trimesh(tm_wall)
+print(
+    f"Open wall after remeshing: {len(loops_after)} boundary loops "
+    f"(expected {len(caps)})"
+)
+if len(loops_after) != len(caps):
+    sizes = sorted((len(loop) for loop in loops_after), reverse=True)
+    raise RuntimeError(
+        f"Open-wall remeshing changed the boundary topology: "
+        f"{len(loops_after)} loops found, {len(caps)} expected. "
+        f"Largest loop sizes={sizes[:10]}."
+    )
+print(
+    "  [post-remesh boundary validation] PASS: all intended openings "
+    "remain simple closed loops."
+)
+
+if WRITE_DEBUG_SURFACES:
+    print(
+        f"Writing remeshed open-wall diagnostic surface: "
+        f"{DEBUG_REMESHED_OPEN_WALL_VTP}"
+    )
+    tm_to_pv(tm_wall).save(DEBUG_REMESHED_OPEN_WALL_VTP)
+
+print("Preparing CLEAN OPEN-WALL surface for SimVascular capping...")
+
+# Convert the validated open wall to PolyData.  No external cap triangles are
+# added in this script: SimVascular will be responsible for capping the holes.
+pv_result = tm_to_pv(tm_wall)
+
+# The remaining surface is entirely wall.  Give every triangle a single
+# ModelFaceID so SimVascular sees a clean wall patch on import.
+pv_result.cell_data["ModelFaceID"] = np.full(
+    pv_result.n_cells,
+    OPEN_WALL_FACE_ID,
+    dtype=np.int32,
+)
+
+assignments = {OPEN_WALL_FACE_ID: "wall"}
+
+print(
+    f"Final OPEN surface: {pv_result.n_points} points | "
+    f"{pv_result.n_cells} cells | {len(loops_after)} openings"
+)
+print(
+    "  NOTE: watertight=False is EXPECTED here because the 64 caps have "
+    "intentionally been removed."
+)
+
+# Final sanity checks for the object that will actually be imported into SV.
+final_tm = pv_to_tm(pv_result)
+_report_mesh_quality(final_tm, label="final open wall for SimVascular")
+final_loops = boundary_loops_from_trimesh(final_tm)
+if len(final_loops) != len(caps):
+    raise RuntimeError(
+        f"Final export changed the number of openings: "
+        f"{len(final_loops)} found, {len(caps)} expected."
+    )
+print(
+    f"  [final export validation] PASS: {len(final_loops)} simple closed "
+    "boundary loops; every boundary vertex has degree 2."
+)
+
+# ============================================================
+# SAVE CLEAN OPEN SURFACE
+# ============================================================
+
+print("Writing CLEAN OPEN-WALL outputs...")
+pv_result.save(OUTPUT_VTP)
+write_facenames(OUTPUT_FACENAMES, assignments)
+
+# Save the original cap metadata so the caps created later in SimVascular can
+# be identified/renamed by position.
+with open(CAP_REFERENCE_CSV, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "name", "old_ModelFaceID",
+        "centroid_x", "centroid_y", "centroid_z",
+        "normal_x", "normal_y", "normal_z",
+        "radius", "plane_tol",
+    ])
+    for cap in caps:
+        c = cap["centroid"]
+        n = cap["normal"]
+        writer.writerow([
+            cap["name"], cap["fid"],
+            float(c[0]), float(c[1]), float(c[2]),
+            float(n[0]), float(n[1]), float(n[2]),
+            float(cap["radius"]), float(cap["plane_tol"]),
+        ])
+
+print("\nFinal assignment:")
+print(f"ModelFaceID={OPEN_WALL_FACE_ID} -> wall")
+print(f"Openings intentionally left uncapped: {len(final_loops)}")
+print(f"Cap reference metadata: {CAP_REFERENCE_CSV}")
+print("\nDONE - import the OPEN VTP into SimVascular and cap the openings there.")
