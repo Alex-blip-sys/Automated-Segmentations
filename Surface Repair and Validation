@@ -13,7 +13,8 @@ Works as a normal standalone script, not a ParaView Programmable Filter.
 
 The operations are conservative by design:
   (1) Preserve input / export diagnostics early.
-  (2) Remove duplicate/degenerate triangles only if topology does not worsen.
+  (2) Diagnose index-identical, exact-coordinate, and near-coincident facets;
+      remove exact duplicates only if topology does not worsen.
   (3) Identify vertex- vs edge-connected components; remove ONLY tiny detached
       components with no cap or inlet faces (and below an area bound).
   (4) Rebuild cap interiors with fixed wall/cap seams using constrained Triangle
@@ -57,16 +58,16 @@ from scipy.spatial import cKDTree
 from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray
 
 # ========================= USER SETTINGS =========================
-INPUT_VTP = r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_gen4_ClotsSubtracted_ClosedBoolean.vtp"
+INPUT_VTP = r"JL_Auto_ClotsSubtracted_ClosedBoolean.vtp"
 INPUT_FACENAMES = INPUT_VTP + ".facenames"
-SUBTRACTION_DIAGNOSTICS_DIR = r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_subtraction_diagnostics"
+SUBTRACTION_DIAGNOSTICS_DIR = r"JL_subtraction_diagnostics"
 # Optional first-script cut/contour diagnostics, listed in reference report.
 TRIMMING_DEBUG_FILES = [
-    r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/Pulmonary_Artery_Cuts_Debug.vtp",
-    r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp",
-    r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/Pulmonary_Artery_Inlet_Rejected_Contours_Debug.vtp",
+    r"Pulmonary_Artery_Cuts_Debug.vtp",
+    r"Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp",
+    r"Pulmonary_Artery_Inlet_Rejected_Contours_Debug.vtp",
 ]
-OUTPUT_DIR = r"/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_surface_repair"
+OUTPUT_DIR = r"JL_surface_repair"
 
 # WELD POINTS: exact positional matches ONLY, and only if validating trial
 # has no worse boundary/nonmanifold edge counts. Near-coincident points must
@@ -105,6 +106,7 @@ CAP_MAX_TRIANGLES = 150000
 INTERSECTION_SCAN_MODE = "targeted"  # targeted | full | off
 INTERSECTION_MAX_SEED_FACES = 40000
 INTERSECTION_MAX_PAIR_TESTS = 250000
+INTERSECTION_MAX_PAIR_TESTS_PER_SEED = 120  # spread finite budget across cap/wall locations
 INTERSECTION_MAX_RECORDS = 3000
 # "targeted" intentionally scans all or a sample of bad cap faces PLUS a
 # smaller sample of suspect wall faces. It cannot certify the whole model.
@@ -359,6 +361,73 @@ def export_patch(mesh,xyz,path,radius,max_faces=DIAGNOSTIC_PATCH_MAX_FACES,locat
     return len(mask)
 
 # ========================= TRANSACTIONAL CLEANUP =========================
+def coincident_facet_groups(mesh, tolerance=0.0, max_records=10000):
+    """Find complete coincident triangle FACETS, including separate point IDs.
+
+    All three 3-D vertices must coincide under a position-based key, independent
+    of winding and vertex IDs. 'near' findings are diagnostic ONLY, never
+    automatically deleted or welded (could otherwise alter the clot lumen).
+    Partly overlapping facets are handled by the collision/overlap checker.
+    """
+    n=len(mesh.faces)
+    if not n:return [],np.zeros(0,dtype=bool)
+    xyz=mesh.points[mesh.faces]
+    if tolerance>0:
+        # Round to nearest grid point. Adjacent bins can hide near coincidences,
+        # so this remains an approximate diagnostic rather than proof of absence.
+        key=np.rint(xyz/tolerance).astype(np.int64)
+    else:
+        key=np.ascontiguousarray(xyz,dtype=np.float64)
+    ordering=np.lexsort((key[:,:,2],key[:,:,1],key[:,:,0]),axis=1)
+    canonical=np.take_along_axis(key,ordering[:,:,None],axis=1).reshape(n,9)
+    _,first,inverse,counts=np.unique(canonical,axis=0,return_index=True,
+                                      return_inverse=True,return_counts=True)
+    groups=np.flatnonzero(counts>1)
+    marked=np.zeros(n,dtype=bool)
+    if not len(groups):return [],marked
+    # Build only duplicated groups, avoiding a costly per-face Python loop.
+    involved=np.flatnonzero(counts[inverse]>1)
+    involved=involved[np.argsort(inverse[involved],kind="stable")]
+    inv_sorted=inverse[involved]
+    boundaries=np.r_[0,np.flatnonzero(np.diff(inv_sorted))+1,len(involved)]
+    rows=[]
+    for k in range(len(boundaries)-1):
+        ids=involved[boundaries[k]:boundaries[k+1]]
+        if len(ids)<2:continue
+        marked[ids]=True
+        if len(rows)>=max_records:continue
+        tri=mesh.faces[int(ids[0])]
+        xyz=mesh.points[tri].mean(axis=0)
+        rows.append({"face_a":int(ids[0]),"face_b":int(ids[1]),
+                     "other_faces": ";".join(str(int(i)) for i in ids[2:]),
+                     "copies":len(ids),
+                     "fid_a":int(mesh.ids[ids[0]]),
+                     "fid_b":int(mesh.ids[ids[1]]),
+                     "label_conflict":len(set(map(int,mesh.ids[ids])))>1,
+                     "x":float(xyz[0]),"y":float(xyz[1]),"z":float(xyz[2]),
+                     "issue":"exact_coincident_facets" if tolerance==0 else "near_coincident_facets"})
+    return rows,marked
+
+
+def duplicate_facet_diagnostics(mesh,names,diagnostics_dir):
+    """Count exact and near-coincident facets; output cap name and XYZ."""
+    exact,mask=coincident_facet_groups(mesh,0.0)
+    diag=float(np.linalg.norm(np.ptp(mesh.points,axis=0)))
+    tol=max(diag*5e-8,1e-9)
+    near,near_mask=coincident_facet_groups(mesh,tol)
+    for row in exact+near:
+        row["face_a_name"]=names.get(row["fid_a"],"Unknown")
+        row["face_b_name"]=names.get(row["fid_b"],"Unknown")
+    write_csv(diagnostics_dir/"exact_duplicate_facets.csv",exact)
+    write_csv(diagnostics_dir/"near_duplicate_facets.csv",near)
+    save_markers(diagnostics_dir/"duplicate_facet_locations.vtp",exact+near[:5000])
+    return {"exact_groups":len(exact),"exact_involved_triangles":int(np.sum(mask)),
+            "near_groups_at_quantization_tolerance":len(near),
+            "near_involved_triangles":int(np.sum(near_mask)),
+            "near_quantization_tolerance":tol,
+            "note":"near duplicates are only candidates; binning is not exhaustive and does not justify deletion"}
+
+
 def cleanup_duplicate_faces_and_degenerates(mesh,diag):
     q,ratio,area=triangle_quality(mesh.points,mesh.faces)
     bbox=np.ptp(mesh.points,axis=0)
@@ -367,10 +436,31 @@ def cleanup_duplicate_faces_and_degenerates(mesh,diag):
     face_valid=(area>tol_area) & np.isfinite(area)
     normalized=np.sort(mesh.faces,axis=1)
     # Duplicate facets irrespective of winding are erroneous in a PLC.
-    _,idx=np.unique(normalized,axis=0,return_index=True)
+    _,idx,inverse,counts=np.unique(normalized,axis=0,return_index=True,
+                                      return_inverse=True,return_counts=True)
     uniq=np.zeros(len(mesh.faces),dtype=bool);uniq[idx]=True
-    keep=face_valid & uniq
+    # Do not silently choose wall vs cap on an identical facet carrying two
+    # different labels. Preserve such facets for explicit correction/reporting.
+    conflicting_label_groups=0
+    for grp in np.flatnonzero(counts>1):
+        member=np.flatnonzero(inverse==grp)
+        if len(np.unique(mesh.ids[member]))>1:
+            uniq[member]=True
+            conflicting_label_groups+=1
+    # Include triangles with distinct vertex indices but exactly coincident
+    # vertex coordinates. Delete only transactionally; a closed surface must
+    # remain closed after cleanup, and contradictory face IDs are not guessed.
+    coincident_rows,coincident_mask=coincident_facet_groups(mesh,0.0)
+    extra_duplicate=np.zeros(len(mesh.faces),dtype=bool)
+    for row in coincident_rows:
+        if row["label_conflict"]:continue
+        for cid in [row["face_b"]] + [int(x) for x in row["other_faces"].split(';') if x]:
+            extra_duplicate[cid]=True
+    keep=face_valid & uniq & ~extra_duplicate
     report={"duplicate_faces":int(np.sum(~uniq)),
+            "ambiguous_duplicate_label_groups":int(conflicting_label_groups),
+            "exact_geometric_duplicate_groups":len(coincident_rows),
+            "geometric_duplicate_faces_for_removal":int(np.sum(extra_duplicate)),
             "degenerate_faces":int(np.sum(~face_valid)),
             "removed":int(np.sum(~keep)),"accepted":False}
     if np.all(keep):return mesh,report
@@ -381,7 +471,9 @@ def cleanup_duplicate_faces_and_degenerates(mesh,diag):
     # count may justify a small increase in boundary edges but never an enormous one.
     added_boundary=max(0,new["boundary_edges"]-old["boundary_edges"])
     accepts=(new["nonmanifold_edges"]<=old["nonmanifold_edges"] and
-             added_boundary<=3*max(1,report["removed"]))
+             # A previously closed fluid surface must NOT acquire holes.
+             (added_boundary==0 if old["boundary_edges"]==0
+              else added_boundary<=3*max(1,report["removed"])))
     report.update(before=old,after=new,accepted=bool(accepts))
     if accepts:return trial,report
     return mesh,report
@@ -541,6 +633,68 @@ def cap_edges(faces):
     return edge[counts==1],int(np.sum(counts>2))
 
 
+def cap_boundary_loop_groups(edges):
+    """Non-destructively describe each connected boundary contour of a cap."""
+    graph=defaultdict(set)
+    for a,b in edges:
+        a=int(a);b=int(b);graph[a].add(b);graph[b].add(a)
+    unvisited=set(graph);groups=[]
+    while unvisited:
+        initial=min(unvisited);stack=[initial];component=[]
+        while stack:
+            v=stack.pop()
+            if v not in unvisited:continue
+            unvisited.remove(v);component.append(v)
+            stack.extend(graph[v]&unvisited)
+        degree={v:len(graph[v]) for v in component}
+        groups.append({"vertex_ids":component,
+                       "degree_not_two":{v:d for v,d in degree.items() if d!=2}})
+    return groups
+
+
+def export_cap_seam_diagnostics(mesh,names,wall_fid,folder):
+    """Cap-by-cap boundary component centers and seam quality, VTP + CSV."""
+    folder=Path(folder)
+    rows=[];edge_points=[];edge_indices=[];edge_fids=[]
+    count_loops=0
+    for fid in sorted(set(map(int,mesh.ids))-{wall_fid}):
+        faces=mesh.faces[mesh.ids==fid]
+        if len(faces)==0:continue
+        boundary,overused=cap_edges(faces)
+        groups=cap_boundary_loop_groups(boundary)
+        name=names.get(fid,"Unknown")
+        count_loops+=len(groups)
+        for groupid,group in enumerate(groups,1):
+            ids=np.asarray(group["vertex_ids"],dtype=np.int64)
+            center=mesh.points[ids].mean(axis=0)
+            owned=set(map(int,ids))
+            es=[e for e in boundary if int(e[0]) in owned and int(e[1]) in owned]
+            if es:
+                ed=np.asarray(es,dtype=np.int64)
+                lengths=np.linalg.norm(mesh.points[ed[:,0]]-mesh.points[ed[:,1]],axis=1)
+                med=float(np.median(lengths));minlength=float(np.min(lengths))
+            else:med=minlength=0.0
+            rows.append({"fid":fid,"cap":name,"loop":groupid,
+                         "num_loops_on_cap":len(groups),"vertices":len(ids),
+                         "edges":len(es),"degree_not_two":len(group["degree_not_two"]),
+                         "overused_cap_edges":overused,
+                         "min_seam_edge":minlength,"median_seam_edge":med,
+                         "min_over_median":minlength/med if med else 0,
+                         "x":float(center[0]),"y":float(center[1]),"z":float(center[2]),
+                         "issue":("multiple_cap_loops" if len(groups)>1 else
+                                  "broken_cap_loop" if group["degree_not_two"] else "single_cap_loop")})
+            for a,b in es:
+                pa=mesh.points[int(a)];pb=mesh.points[int(b)]
+                k=len(edge_points);edge_points.extend([pa,pb]);edge_indices.append((k,k+1));edge_fids.append(fid)
+    write_csv(folder/"cap_boundary_loops.csv",rows)
+    save_markers(folder/"cap_loop_centers.vtp",rows)
+    if edge_indices:
+        write_edge_lines(folder/"all_cap_seam_edges.vtp",np.asarray(edge_points),np.asarray(edge_indices))
+    return {"total_cap_boundary_loops":count_loops,
+            "caps_with_multiple_loops":[r["cap"] for r in rows if r["num_loops_on_cap"]>1 and r["loop"]==1],
+            "caps_with_broken_loop_degree":[r["cap"] for r in rows if r["degree_not_two"]>0]}
+
+
 def order_one_loop(edges):
     graph=defaultdict(list)
     for a,b in edges:
@@ -601,24 +755,42 @@ def valid_polygon(uv,eps):
 
 
 def vtk_triangulate_fixed_contour(uv):
-    # vtkContourTriangulator reliably preserves original points and edges,
-    # but it can create poor triangles. Triangle backend is preferred.
-    p3=np.column_stack((uv,np.zeros(len(uv))))
+    """Triangulate using VTK, but use ORIGINAL double-precision seam coordinates.
+
+    vtkPoints defaults to float in some VTK builds. Float roundoff was falsely
+    triggering 'VTK modified original perimeter coordinates' at large image
+    coordinates. Output vertex order also need not equal input vertex order.
+    No seam vertex is ever moved or inserted into the surrounding wall.
+    """
+    uv=np.ascontiguousarray(uv,dtype=np.float64)
+    n=len(uv)
+    p3=np.column_stack((uv,np.zeros(n,dtype=np.float64)))
     poly=vtk.vtkPolyData();pts=vtk.vtkPoints()
-    for p in p3:pts.InsertNextPoint(*map(float,p))
+    pts.SetDataTypeToDouble()
+    pts.SetNumberOfPoints(n)
+    for i,p in enumerate(p3):pts.SetPoint(i,float(p[0]),float(p[1]),0.0)
     lines=vtk.vtkCellArray()
-    for i in range(len(uv)):
-        lines.InsertNextCell(2);lines.InsertCellPoint(i);lines.InsertCellPoint((i+1)%len(uv))
+    for i in range(n):
+        lines.InsertNextCell(2);lines.InsertCellPoint(i);lines.InsertCellPoint((i+1)%n)
     poly.SetPoints(pts);poly.SetLines(lines)
     filt=vtk.vtkContourTriangulator();filt.SetInputData(poly);filt.Update()
     ans=filt.GetOutput()
-    if ans.GetNumberOfPolys()==0:raise ValueError("vtkContourTriangulator returned no triangles")
+    if ans.GetNumberOfPolys()==0:
+        raise ValueError("vtkContourTriangulator returned no triangles")
     outpoints=np.asarray(vtk_to_numpy(ans.GetPoints().GetData()),dtype=np.float64)
-    tri=np.asarray(vtk_to_numpy(ans.GetPolys().GetConnectivityArray()),dtype=np.int64).reshape(-1,3).copy()
-    if len(outpoints)!=len(uv) or not np.allclose(outpoints[:,:2],uv,atol=1e-7,rtol=0):
-        raise ValueError("VTK modified original perimeter coordinates")
-    return outpoints[:,:2],tri
-
+    raw=np.asarray(vtk_to_numpy(ans.GetPolys().GetConnectivityArray()),dtype=np.int64)
+    if len(raw)%3:raise ValueError("VTK returned non-triangle cap polygons")
+    tri=raw.reshape(-1,3).copy()
+    if len(outpoints)!=n:
+        raise ValueError("VTK changed the perimeter vertex count ({} -> {})".format(n,len(outpoints)))
+    # If VTK has only permuted/reindexed the loop vertices, restore the input
+    # IDs so the old wall/cap seam can be stitched exactly.
+    tolerance=max(float(np.ptp(uv,axis=0).max())*1e-11,1e-11)
+    distances,mapping=cKDTree(uv).query(outpoints[:,:2],k=1)
+    if np.max(distances)>tolerance or len(np.unique(mapping))!=n:
+        raise ValueError("VTK changed perimeter geometry (maximum coordinate error {:.6g})".format(float(np.max(distances))))
+    tri=mapping[tri]
+    return uv.copy(),np.asarray(tri,dtype=np.int64)
 
 def triangulate_cap(uv,backend,median_edge):
     if backend in ("auto","triangle"):
@@ -874,6 +1046,49 @@ def _coplanar_contact(A,B,n):
     return None
 
 
+def coplanar_overlap_area(A,B):
+    """Return strictly positive 3D area of overlap for coplanar triangles.
+
+    Ordinary shared boundaries have zero area. Valid touching facets are thus
+    NOT flagged, even when they share one or two vertex IDs.
+    """
+    normal=np.cross(A[1]-A[0],A[2]-A[0]);length=float(np.linalg.norm(normal))
+    normb=np.cross(B[1]-B[0],B[2]-B[0]);blength=float(np.linalg.norm(normb))
+    if min(length,blength)<1e-18:return 0.0
+    scale=max(float(np.linalg.norm(np.ptp(np.vstack((A,B)),axis=0))),1e-12)
+    if np.linalg.norm(np.cross(normal/length,normb/blength))>1e-8:return 0.0
+    if np.max(np.abs((B-A[0])@(normal/length)))>scale*1e-9:return 0.0
+    drop=int(np.argmax(abs(normal)))
+    axes=[i for i in range(3) if i!=drop]
+    subject=A[:,axes].copy();clip=B[:,axes]
+    cb=clip[1]-clip[0];cc=clip[2]-clip[0]
+    sign=1.0 if cb[0]*cc[1]-cb[1]*cc[0]>0 else -1.0
+    eps=max(scale**2*1e-13,1e-22)
+    def oriented(a,b,p):
+        d=b-a;v=p-a
+        return sign*(d[0]*v[1]-d[1]*v[0])
+    for edge in range(3):
+        if len(subject)==0:return 0.0
+        start=clip[edge];end=clip[(edge+1)%3]
+        res=[];prev=subject[-1];pval=oriented(start,end,prev)
+        for curr in subject:
+            cval=oriented(start,end,curr)
+            cin=cval>=-eps;pin=pval>=-eps
+            if cin!=pin:
+                denom=pval-cval
+                if abs(denom)>1e-30:
+                    t=pval/denom
+                    res.append(prev+t*(curr-prev))
+            if cin:res.append(curr)
+            prev,pval=curr,cval
+        subject=np.asarray(res,dtype=float).reshape(-1,2)
+    if len(subject)<3:return 0.0
+    area=0.5*abs(float(np.sum(subject[:,0]*np.roll(subject[:,1],-1)-
+                                 subject[:,1]*np.roll(subject[:,0],-1))))
+    # Projection discards the dominant normal component, so correct 2D area.
+    return area/max(abs(normal[drop]/length),1e-15) if area>max(scale**2*1e-12,1e-18) else 0.0
+
+
 def triangle_triangle_contact(A,B):
     """True triangle crossing/overlap, with a representative ACTUAL hit XYZ.
     Handles both noncoplanar edge/face crossings and coplanar overlap.
@@ -901,7 +1116,8 @@ def intersection_scan(mesh,names,wall_fid,output_dir,full=False):
     mode="full" if full else INTERSECTION_SCAN_MODE
     record={"mode":mode,"complete":False,"pairs_tested":0,"faces_checked":0,
             "confirmed_pairs":0,"records":[],"limitations":[
-                "Triangles sharing any vertex are excluded; they may still intersect away from that vertex.",
+                "Shared-edge triangles checked for positive-area coplanar overlap, not ordinary seam contact.",
+                "Shared-vertex triangle crossings away from that vertex are evaluated; floating-point predicate limits apply.",
                 "Floating-point segment/triangle contact is not a proof against near-tangencies; CGAL may be needed for robust predicates.",
                 "Targeted and budget-exhausted scans cannot certify a collision-free PLC."]}
     if mode=="off":
@@ -931,9 +1147,14 @@ def intersection_scan(mesh,names,wall_fid,output_dir,full=False):
             n_rest=max(0,INTERSECTION_MAX_SEED_FACES-len(cap_priority))
             if len(others)>n_rest:others=np.sort(rng.choice(others,size=n_rest,replace=False))
             seeds=np.sort(np.concatenate((cap_priority,others)))
+    # Deterministic order mixing inlet/outlet/wall candidates; otherwise very
+    # dense early caps can exhaust the test budget before other faces get seen.
+    if mode!="full":
+        seeds=np.random.default_rng(82541).permutation(seeds)
     poly=vtk_mesh(mesh);loc=vtk.vtkStaticCellLocator()
     loc.SetDataSet(poly);loc.BuildLocator()
     matches=[];seen=set();tested=0;finished=True;checked=0
+    truncated_seed_count=0
     nearest=cap_reference_lookup(mesh,names,wall_fid)
     diag=float(np.linalg.norm(np.ptp(mesh.points,axis=0)))
     padding=max(diag*1e-11,1e-11)
@@ -943,6 +1164,7 @@ def intersection_scan(mesh,names,wall_fid,output_dir,full=False):
         mini=a.min(axis=0)-padding;maxi=a.max(axis=0)+padding
         box=[mini[0],maxi[0],mini[1],maxi[1],mini[2],maxi[2]]
         hits=vtk.vtkIdList();loc.FindCellsWithinBounds(box,hits)
+        seed_pair_tests=0
         for k in range(hits.GetNumberOfIds()):
             j=int(hits.GetId(k))
             if j==cid:continue
@@ -952,23 +1174,45 @@ def intersection_scan(mesh,names,wall_fid,output_dir,full=False):
             # Canonical ordering without materializing pair set of all candidates.
             if mode=="full" and j<cid:continue
             vb=mesh.faces[j]
-            if any(int(x) in vb for x in va):continue
+            shared=np.intersect1d(va,vb,assume_unique=True)
+            if len(shared)==3:continue  # same indexed facet checked elsewhere
             # Bound seen set / avoid massive memory for highly overlapping meshes.
             seen.add(key)
             if len(seen)>INTERSECTION_MAX_PAIR_TESTS*2:
                 seen.clear()
+            if seed_pair_tests>=INTERSECTION_MAX_PAIR_TESTS_PER_SEED and mode!="full":
+                truncated_seed_count+=1
+                break
             tested+=1
+            seed_pair_tests+=1
             if tested>INTERSECTION_MAX_PAIR_TESTS:
                 finished=False;break
             b=mesh.points[vb]
-            xyz=triangle_triangle_contact(a,b)
+            overlap_area=coplanar_overlap_area(a,b) if len(shared) else 0.0
+            if len(shared)>=2 and overlap_area==0.0:
+                continue  # ordinary shared edge: not an intersection
+            xyz=triangle_triangle_contact(a,b) if overlap_area==0.0 else (a.mean(axis=0)+b.mean(axis=0))*0.5
+            if len(shared)==1 and xyz is not None and overlap_area==0.0:
+                # Contact at the shared point is valid; look for a different
+                # crossing that is not explained by this one shared vertex.
+                p=mesh.points[shared[0]]
+                if np.linalg.norm(xyz-p)<max(padding*10,1e-9):
+                    xyz=None
+                    for triangle,other in ((a,b),(b,a)):
+                        for ei in range(3):
+                            candidate=_segment_triangle_contact(triangle[ei],triangle[(ei+1)%3],other)
+                            if candidate is not None and np.linalg.norm(candidate-p)>max(padding*10,1e-9):
+                                xyz=candidate;break
+                        if xyz is not None:break
             if xyz is not None:
                 fa=int(mesh.ids[cid]);fb=int(mesh.ids[j]);nid,nname=nearest(xyz)
                 capname=names.get(fa,str(fa)) if fa!=wall_fid else (
                         names.get(fb,str(fb)) if fb!=wall_fid else nname)
                 matches.append({"face_a":cid,"face_b":j,"fid_a":fa,"fid_b":fb,
                                 "fid":fa if fa!=wall_fid else (fb if fb!=wall_fid else nid),
-                                "cap":capname,"issue":"nonadjacent_triangle_intersection",
+                                "cap":capname,"issue":("coplanar_positive_area_facet_overlap" if overlap_area>0
+                                                       else "triangle_intersection"),
+                                "overlap_area":overlap_area,"shared_vertex_count":int(len(shared)),
                                 "x":float(xyz[0]),"y":float(xyz[1]),"z":float(xyz[2]),
                                 "severity":3})
                 if len(matches)>=INTERSECTION_MAX_RECORDS:
@@ -978,11 +1222,17 @@ def intersection_scan(mesh,names,wall_fid,output_dir,full=False):
             print("   intersection pass: {:,}/{:,} seeds, {:,} pair tests, {} confirmations".format(
                 ix,len(seeds),tested,len(matches)),flush=True)
     record.update(complete=bool(finished and mode=="full" and checked==n),
-                  covered_target_seeds=bool(finished),faces_checked=int(checked),
+                  covered_target_seeds=bool(finished and not truncated_seed_count),faces_checked=int(checked),
                   pairs_tested=int(min(tested,INTERSECTION_MAX_PAIR_TESTS)),
+                  truncated_seed_count=int(truncated_seed_count),
                   confirmed_pairs=len(matches),records=matches)
     write_csv(output_dir/"intersection_pairs.csv",matches)
     save_markers(output_dir/"intersection_locations.vtp",matches)
+    overlaps=[row for row in matches
+              if row["issue"]=="coplanar_positive_area_facet_overlap"]
+    write_csv(output_dir/"coplanar_overlapping_facets.csv",overlaps)
+    save_markers(output_dir/"coplanar_overlap_locations.vtp",overlaps)
+    record["positive_area_coplanar_overlaps"]=len(overlaps)
     return record
 
 
@@ -1197,6 +1447,8 @@ def main(argv=None):
         if TRY_CLEAN_DUPLICATE_AND_DEGENERATE_FACES:
             mesh,rec=cleanup_duplicate_faces_and_degenerates(mesh,diag)
             history.append({"operation":"remove_duplicate_degenerate_faces",**rec})
+            print("  Exact indexed duplicates: {}; exact-coordinate coincident-facet groups: {}".format(
+                rec["duplicate_faces"],rec["exact_geometric_duplicate_groups"]),flush=True)
         if TRY_EXACT_POINT_WELD:
             mesh,rec=exact_vertex_weld(mesh)
             history.append({"operation":"exact_coordinate_point_weld",**rec})
@@ -1219,6 +1471,12 @@ def main(argv=None):
             mesh,wall_records=collapse_extremely_short_wall_edges(mesh,wall_fid,diag)
         history.append({"operation":"wall_short_edge_collapse","records":wall_records})
         if WRITE_CHECKPOINTS:save_mesh(mesh,out/"checkpoints"/"03b_wall_edges.vtp")
+        # Explicit duplicate-facet and cap-boundary diagnostics, even when
+        # reconstruction was rejected (e.g. INLET contains multiple loops).
+        report["duplicate_facet_diagnostics"]=duplicate_facet_diagnostics(mesh,names,diag)
+        report["cap_seam_diagnostics"]=export_cap_seam_diagnostics(mesh,names,wall_fid,diag)
+        print("  Duplicate facets:",report["duplicate_facet_diagnostics"],flush=True)
+        print("  Cap seam loops:",report["cap_seam_diagnostics"],flush=True)
         # Always write a candidate, even when it contains unresolved defects.
         candidate_path=out/"repaired_closed.vtp"
         save_mesh(mesh,candidate_path)
@@ -1284,13 +1542,15 @@ def main(argv=None):
                      q["zero_area_count"]==0)
         no_missing_caps=not failed and not prior["cap_warnings"]
         no_intersections=(scan["complete"] and scan["confirmed_pairs"]==0)
+        no_exact_duplicate_facets=(report["duplicate_facet_diagnostics"]["exact_groups"]==0)
         report["status"]="UNRESOLVED_REPAIR_REQUIRED"
         report["acceptance_checks"]={"single_edge_connected_component":len(sizes)==1,
              "watertight_by_edge_counts":final_top["watertight_by_edge_counts"],
              "no_zero_area_triangles":q["zero_area_count"]==0,
+             "no_exact_coincident_duplicate_facets":no_exact_duplicate_facets,
              "no_unresolved_cap_rebuilds_or_assignments":no_missing_caps,
              "complete_no_reported_intersections":no_intersections}
-        if topological and no_missing_caps and no_intersections:
+        if topological and no_missing_caps and no_intersections and no_exact_duplicate_facets:
             report["status"]="SURFACE_QA_PASSED_GMSH_UNTESTED"
         if args.gmsh or RUN_GMSH_PREFLIGHT:
             if not topological:
@@ -1299,7 +1559,7 @@ def main(argv=None):
             else:
                 print("\nSTAGE 7 - Optional Gmsh volume-meshing preflight",flush=True)
                 report["gmsh"]=run_gmsh_preflight(mesh,out)
-                if report["gmsh"]["success"] and no_missing_caps and no_intersections:
+                if report["gmsh"]["success"] and no_missing_caps and no_intersections and no_exact_duplicate_facets:
                     report["status"]="MESH_PREFLIGHT_PASSED"
                     save_mesh(mesh,out/"mesh_preflight_passed.vtp")
                     write_facenames(out/"mesh_preflight_passed.vtp.facenames",names)
@@ -1323,4 +1583,8 @@ def main(argv=None):
 
 
 if __name__=="__main__":
-    sys.exit(main())
+    _exit_code=main()
+    if "IPython" in sys.modules or "spyder_kernels" in sys.modules:
+        print("Finished with status code {} (no interactive SystemExit).".format(_exit_code))
+    else:
+        sys.exit(_exit_code)
