@@ -1,6 +1,10 @@
 import sys
 import re
 import csv
+import json
+from pathlib import Path
+from collections import defaultdict, deque
+import traceback
 
 # ============================================================
 # PYTHON / DEPENDENCY COMPATIBILITY
@@ -53,23 +57,68 @@ except ImportError as exc:
 # INPUTS
 # ============================================================
 
-BASE_VTP = r"Healthy_Model.vtp"
+BASE_VTP = r"JL_gen4_trimmedModel.vtp"
 
 TOOL_VTPS = [
    r"Clot_Proximal_RPA_Remeshed.vtp",
-   r"Clot_Proximal_LPA_Remeshed.vtp"
+   r"Clot_Proximal_LPA_Remeshed.vtp",
+   # r"Clot_Distal_LPA_Lower_Remeshed.vtp",
+   # r"Clot_Distal_LPA_Upper_Remeshed.vtp",
+   # r"Clot_Distal_RPA_Lower_Remeshed.vtp",
+   # r"Clot_Distal_RPA_Upper_Remeshed.vtp"
+   
+   
 
 ]
 
-OLD_FACENAMES = r"Healthy_Model.vtp.facenames"
+OLD_FACENAMES = r"JL_gen4_trimmedModel.vtp.facenames"
 
-OUTPUT_VTP = r"JL_Auto_ClotsSubtracted_OpenWall.vtp"
+OUTPUT_VTP = r"JL_gen4_OpenWall.vtp"
 
 OUTPUT_FACENAMES = (
-    r"JL_Auto_ClotsSubtracted_OpenWall.vtp.facenames"
+    r"JL_gen4_OpenWall.vtp.facenames"
 )
 
-CAP_REFERENCE_CSV = r"JL_Auto_ClotsSubtracted_OpenWall_cap_reference.csv"
+CAP_REFERENCE_CSV = r"JL_gen4_ClosedBoolean_cap_reference.csv"
+
+# Files below are ALWAYS written if the boolean subtraction succeeds, even
+# when subsequent cap removal or remeshing exposes broken boundary loops.
+CLOSED_BOOLEAN_OUTPUT_VTP = r"JL_gen4_ClotsSubtracted_ClosedBoolean.vtp"
+CLOSED_BOOLEAN_OUTPUT_FACENAMES = CLOSED_BOOLEAN_OUTPUT_VTP + ".facenames"
+
+# This is now the PRIMARY output. The downstream open-wall/cap-removal
+# workflow is optional and disabled by default to avoid needless work.
+GENERATE_OPEN_WALL_SECONDARY = False
+
+# A source cap is assigned to a local, connected planar triangle patch on
+# the POST-BOOLEAN closed surface. The original face IDs and names are used.
+# These values are deliberately conservative: failed/ambiguous cap matches
+# are reported instead of incorrectly labeling vessel-wall triangles.
+CLOSED_CAP_SEARCH_RADIUS_FACTOR = 1.30
+CLOSED_CAP_EXTRA_SEARCH_EDGES = 2.0
+CLOSED_CAP_MIN_NORMAL_ALIGNMENT = 0.985
+CLOSED_CAP_PLANE_TOL_MULTIPLIER = 3.0
+CLOSED_CAP_MIN_PLANE_EDGE_TOL = 0.20
+CLOSED_CAP_MIN_CONNECTED_TRIANGLES = 3
+CLOSED_CAP_MAX_AREA_RATIO = 1.65
+CLOSED_CAP_MIN_AREA_RATIO_WARNING = 0.50
+CLOSED_CAP_PRINT_EVERY = 50
+DIAGNOSTIC_DIR = Path(r"JL_subtraction_diagnostics")
+SAVE_EACH_BOOLEAN_STAGE = True
+DIAGNOSTICS_ENABLED = True
+DIAGNOSTIC_MAX_PATCHES = 12
+DIAGNOSTIC_PATCH_RADIUS_MULTIPLIER = 2.0
+
+# Do not discard the subtraction if a cap is not found or an opening is pinched.
+# An imperfect output VTP will be saved, but it will be clearly marked as
+# requiring manual repairs before use for SimVascular meshing.
+ALLOW_PARTIAL_CAP_REMOVAL = True
+ALLOW_INVALID_OPEN_SURFACE_EXPORT = True
+TRY_REMESH_ON_INVALID_BOUNDARY = False
+
+# Diagnostic/report state (filled during the run).
+CAP_REMOVAL_RECORDS = []
+PIPELINE_REPORT = {"stages": [], "warnings": [], "errors": [], "status": "started"}
 
 # All triangles remaining in the exported open surface are vessel wall.
 # Keeping the historical wall ID avoids changing downstream conventions.
@@ -83,15 +132,15 @@ CAP_PERCENTILE = 99
 
 # thickness allowed around cap plane
 # increase slightly if caps miss triangles
-PLANE_TOL_FACTOR = 0.005
+PLANE_TOL_FACTOR = 0.001
 
 # ----------------------------
 # Wall remeshing + export for SimVascular capping
 # ----------------------------
-# IMPORTANT: This version deliberately throws away every old cap triangle.
-# The boolean result is opened at all stored cap planes, the OPEN wall is
-# remeshed and validated, and the clean open surface is exported for capping
-# inside SimVascular. No external cap triangulation is performed.
+# The PRIMARY output now retains the closed boolean geometry, with
+# ModelFaceID and facenames generated from original cap references.
+# Optionally, a SECONDARY output may remove cap triangles, remesh the open
+# wall and export for manual editing / recapping inside SimVascular.
 REBUILD_CAPS_FROM_SCRATCH = True
 ENABLE_UNIFORM_REMESH = True
 
@@ -759,11 +808,18 @@ def strip_all_caps(tm, caps, target_edge_length):
             seed_candidates = np.where(acceptable)[0]
 
         if len(seed_candidates) == 0:
-            raise RuntimeError(
-                f"Could not find a planar seed triangle for cap '{cap['name']}'. "
-                f"Try lowering CAP_GROW_MIN_NORMAL_ALIGNMENT slightly (currently "
-                f"{CAP_GROW_MIN_NORMAL_ALIGNMENT})."
+            msg = (
+                f"Could not find a planar seed triangle for cap '{cap['name']}' "
+                f"(fid={cap['fid']}). Inspect the original cap or "
+                "adjust CAP_GROW_MIN_NORMAL_ALIGNMENT carefully."
             )
+            CAP_REMOVAL_RECORDS.append({"name": cap["name"], "fid": cap["fid"],
+                                        "status": "FAILED_NO_SEED", "reason": msg,
+                                        "x": float(c[0]), "y": float(c[1]), "z": float(c[2])})
+            if ALLOW_PARTIAL_CAP_REMOVAL:
+                print("  WARNING:", msg)
+                continue
+            raise RuntimeError(msg)
 
         seed = int(seed_candidates[np.argmin(euclid[seed_candidates])])
 
@@ -787,17 +843,30 @@ def strip_all_caps(tm, caps, target_edge_length):
                     stack.append(nb)
 
         if len(region) < CAP_GROW_MIN_TRIANGLES:
-            raise RuntimeError(
-                f"Planar region for cap '{cap['name']}' contained only "
-                f"{len(region)} triangles. Seed face={seed}. "
-                "The cap plane criteria are probably too strict or the cap is not planar."
-            )
+            msg = (f"Cap '{cap['name']}' (fid={cap['fid']}): "
+                   f"only {len(region)} triangles; seed={seed}. "
+                   "Likely cap misidentification, poor planarity, or missing cap.")
+            CAP_REMOVAL_RECORDS.append({"name": cap["name"], "fid": cap["fid"],
+                                        "status": "FAILED_SMALL_REGION", "reason": msg,
+                                        "x": float(c[0]), "y": float(c[1]), "z": float(c[2])})
+            if ALLOW_PARTIAL_CAP_REMOVAL:
+                print("  WARNING:", msg)
+                continue
+            raise RuntimeError(msg)
 
         region = np.asarray(region, dtype=np.int64)
         remove[region] = True
 
         max_plane_error = float(np.max(np.abs(signed[region])))
         min_alignment = float(np.min(alignment[region]))
+        region_center = np.mean(centroids[region], axis=0)
+        CAP_REMOVAL_RECORDS.append({
+            "name": cap["name"], "fid": cap["fid"], "status": "REMOVED",
+            "reason": "", "triangles_removed": int(len(region)),
+            "max_plane_error": max_plane_error, "min_normal_alignment": min_alignment,
+            "x": float(region_center[0]), "y": float(region_center[1]),
+            "z": float(region_center[2]), "seed_face": seed
+        })
         print(
             f"  [remove old cap] '{cap['name']}': "
             f"region={len(region)} triangles | seed={seed} | "
@@ -806,7 +875,10 @@ def strip_all_caps(tm, caps, target_edge_length):
         )
 
     if not remove.any():
-        raise RuntimeError("No cap triangles were identified for removal.")
+        msg = "No cap triangles were identified for removal. Saving the intact boolean result."
+        if not ALLOW_PARTIAL_CAP_REMOVAL:
+            raise RuntimeError(msg)
+        print("  WARNING:", msg)
 
     wall = trimesh.Trimesh(
         vertices=v,
@@ -814,23 +886,22 @@ def strip_all_caps(tm, caps, target_edge_length):
         process=False,
     )
     wall.remove_unreferenced_vertices()
-    wall = repair_open_surface(wall)
+    # Even the conservative cleanup can sometimes fail on an unusually
+    # pathological boolean seam. Keep the raw subtraction-derived opening
+    # instead of losing the entire run.
+    try:
+        repaired_wall = repair_open_surface(wall)
+        if repaired_wall.faces.shape[0] == 0:
+            raise RuntimeError("Open-wall cleanup removed all triangles")
+        wall = repaired_wall
+    except Exception as exc:
+        print(f"  WARNING: open-wall cleanup failed: {type(exc).__name__}: {exc}")
+        print("  Retaining raw cap-stripped surface for manual repair.")
 
-    # Hard validation gate: cap deletion itself must yield one simple loop
-    # per original cap before ACVD is allowed to touch the wall.
-    loops = boundary_loops_from_trimesh(wall)
-    if len(loops) != len(caps):
-        sizes = sorted((len(loop) for loop in loops), reverse=True)
-        raise RuntimeError(
-            f"Cap region-growing produced {len(loops)} simple boundary loops, "
-            f"but {len(caps)} were expected. Largest loop sizes={sizes[:10]}. "
-            "Stopping before remeshing so the source of the problem remains isolated."
-        )
-
-    print(
-        f"  [cap deletion validation] PASS: {len(loops)} simple closed "
-        "boundary loops; every boundary vertex has degree 2."
-    )
+    # Opening topology is inspected in the main diagnostics pipeline.
+    # Previously a pinched boundary vertex (degree 4) caused an exception here,
+    # preventing any output from being written. We intentionally return the
+    # partially opened wall so the offending coordinates can be exported.
     return wall
 
 
@@ -1143,6 +1214,9 @@ def extract_cap_info(
         sub = surface.extract_cells(cell_ids)
         sub_clean = sub.clean()
         pts = np.array(sub_clean.points)
+        # Retain original cap surface area to detect accidental wall capture
+        # or incomplete cap matches after manifold boolean operations.
+        reference_cap_area = float(sub_clean.extract_surface().triangulate().area)
         centroid = pts.mean(axis=0)
         centered = pts - centroid
         _, _, vh = np.linalg.svd(centered, full_matrices=False)
@@ -1187,6 +1261,7 @@ def extract_cap_info(
             "radius": radius,
 
             "plane_tol": plane_tol,
+            "surface_area": reference_cap_area,
         })
 
         print(
@@ -1282,6 +1357,603 @@ def build_assignments(
     assignments[wall_fid] = "wall"
 
     return tri, assignments
+
+
+# ============================================================
+# POST-BOOLEAN CLOSED SURFACE: ModelFaceID + FACENAMES
+# ============================================================
+
+def assign_closed_boolean_cap_faces(tm, caps, source_facenames, local_edge_length):
+    """Recognize retained cap triangles on a *closed* boolean surface.
+
+    After manifold3d/trimesh booleans the input's old cell-data labels are
+    unavailable. We therefore use the original cap geometry (centroid,
+    plane normal, radius, and surface area) as a spatial reference.
+
+    Find triangles locally with cKDTree, then assign the single edge-connected
+    planar component around the cap center. This avoids allocating a global
+    3-million-face adjacency list or testing every face for every cap.
+
+    Ambiguous/missing caps remain wall and are explicitly reported. This
+    function does not change a single vertex or triangle of the boolean mesh.
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError as exc:
+        raise RuntimeError(
+            "Closed cap assignment needs SciPy's cKDTree. "
+            "Install scipy in the running Python environment."
+        ) from exc
+
+    face_names = {int(fid): str(name) for fid, name in source_facenames.items()}
+    wall_entries = [(fid, name) for fid, name in face_names.items()
+                    if "wall" in name.lower()]
+    if len(wall_entries) == 1:
+        wall_fid, wall_name = wall_entries[0]
+    elif len(wall_entries) == 0:
+        wall_fid = max(face_names, default=0) + 1
+        wall_name = "wall"
+        print(f"  WARNING: source .facenames has no wall entry; using new ID={wall_fid}")
+    else:
+        # Do not arbitrarily select from multiple wall surfaces.
+        raise RuntimeError(f"Multiple wall-named faces in source: {wall_entries}")
+
+    vertices = np.asarray(tm.vertices, dtype=np.float64)
+    faces = np.asarray(tm.faces, dtype=np.int64)
+    n_faces = len(faces)
+    if n_faces == 0:
+        raise RuntimeError("Boolean surface contains no triangles")
+
+    # Compute face centroids/normals/areas in chunks. This controls temporary
+    # allocations on multimillion-triangle pulmonary-artery geometries.
+    centroids = np.empty((n_faces, 3), dtype=np.float64)
+    normals = np.empty((n_faces, 3), dtype=np.float32)
+    face_areas = np.empty(n_faces, dtype=np.float32)
+    for start in range(0, n_faces, 200_000):
+        end = min(start + 200_000, n_faces)
+        tri = faces[start:end]
+        a, b, c = vertices[tri[:, 0]], vertices[tri[:, 1]], vertices[tri[:, 2]]
+        centroids[start:end] = (a + b + c) / 3.0
+        cross = np.cross(b - a, c - a)
+        double_area = np.linalg.norm(cross, axis=1)
+        face_areas[start:end] = 0.5 * double_area
+        good = double_area > 1.0e-20
+        cross[good] /= double_area[good, None]
+        cross[~good] = 0
+        normals[start:end] = cross
+
+    print(f"  Indexing {n_faces:,} closed-surface triangles for spatial cap matching...")
+    centroid_tree = cKDTree(centroids)
+    face_ids = np.full(n_faces, int(wall_fid), dtype=np.int32)
+    records = []
+    assigned_names = {int(wall_fid): wall_name}
+    n_done = 0
+
+    for cap in caps:
+        fid = int(cap["fid"])
+        name = str(cap["name"])
+        center = np.asarray(cap["centroid"], dtype=np.float64)
+        normal = np.asarray(cap["normal"], dtype=np.float64)
+        normal /= max(float(np.linalg.norm(normal)), 1.0e-30)
+        radius = float(cap["radius"])
+        reference_area = float(cap.get("surface_area", 0.0))
+        record = {
+            "name": name, "fid": fid, "reference_area": reference_area,
+            "x": float(center[0]), "y": float(center[1]), "z": float(center[2]),
+            "status": "UNTESTED", "triangles": 0,
+            "area_ratio": "", "max_plane_error": "", "min_normal_alignment": "",
+            "overlapping_candidates": 0, "reason": "",
+        }
+
+        search_radius = max(
+            radius * CLOSED_CAP_SEARCH_RADIUS_FACTOR
+            + CLOSED_CAP_EXTRA_SEARCH_EDGES * local_edge_length,
+            4.0 * local_edge_length,
+        )
+        ids = np.asarray(centroid_tree.query_ball_point(center, search_radius),
+                         dtype=np.int64)
+        if len(ids) == 0:
+            record.update(status="MISSING", reason="No triangles near original cap center")
+            records.append(record)
+            continue
+
+        offsets = centroids[ids] - center
+        signed_distance = offsets @ normal
+        radial_distance = np.linalg.norm(
+            offsets - signed_distance[:, None] * normal, axis=1)
+        alignments = np.abs(normals[ids].astype(np.float64) @ normal)
+        plane_tol = max(
+            CLOSED_CAP_PLANE_TOL_MULTIPLIER * float(cap["plane_tol"]),
+            CLOSED_CAP_MIN_PLANE_EDGE_TOL * local_edge_length,
+        )
+        mask = ((np.abs(signed_distance) <= plane_tol)
+                & (alignments >= CLOSED_CAP_MIN_NORMAL_ALIGNMENT)
+                & (radial_distance <= search_radius))
+        eligible = ids[mask]
+        if len(eligible) < CLOSED_CAP_MIN_CONNECTED_TRIANGLES:
+            record.update(status="MISSING", reason=(
+                f"Only {len(eligible)} locally planar, aligned triangles; "
+                f"plane_tol={plane_tol:.6g}"))
+            records.append(record)
+            continue
+
+        eligible_offsets = offsets[mask]
+        near = np.linalg.norm(eligible_offsets, axis=1)
+        seed_limit = max(0.7 * radius, 2.0 * local_edge_length)
+        if np.min(near) > seed_limit:
+            record.update(status="MISSING", reason=(
+                f"Nearest eligible triangle is {np.min(near):.6g} from cap center, "
+                f"beyond seed limit {seed_limit:.6g}"))
+            records.append(record)
+            continue
+        seed = int(eligible[int(np.argmin(near))])
+
+        # Locally assemble edge adjacency. Global O(F) Python lists would use
+        # excessive memory, especially with >1000 outlet caps.
+        neighbors = defaultdict(list)
+        edge_owner = {}
+        for global_id in eligible:
+            gid = int(global_id)
+            p0, p1, p2 = (int(v) for v in faces[gid])
+            for u, v in ((p0, p1), (p1, p2), (p2, p0)):
+                edge = (u, v) if u < v else (v, u)
+                if edge in edge_owner:
+                    other = edge_owner[edge]
+                    neighbors[gid].append(other)
+                    neighbors[other].append(gid)
+                else:
+                    edge_owner[edge] = gid
+
+        region = []
+        stack = [seed]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            region.append(current)
+            stack.extend(other for other in neighbors[current] if other not in seen)
+        region = np.asarray(region, dtype=np.int64)
+        if len(region) < CLOSED_CAP_MIN_CONNECTED_TRIANGLES:
+            record.update(status="MISSING", reason=(
+                f"Seed's connected patch has only {len(region)} triangles"))
+            records.append(record)
+            continue
+
+        overlap = int(np.count_nonzero(face_ids[region] != wall_fid))
+        record["overlapping_candidates"] = overlap
+        if overlap:
+            record.update(status="AMBIGUOUS", reason=(
+                f"{overlap} triangles already assigned to another cap"))
+            records.append(record)
+            continue
+
+        area = float(np.sum(face_areas[region], dtype=np.float64))
+        ratio = area / reference_area if reference_area > 0 else float("nan")
+        record["area_ratio"] = ratio
+        record["triangles"] = int(len(region))
+        # Oversized patches indicate planar vessel wall or an adjacent cap
+        # was accidentally reached. Never label a suspicious patch as a cap.
+        if reference_area > 0 and ratio > CLOSED_CAP_MAX_AREA_RATIO:
+            record.update(status="AMBIGUOUS", reason=(
+                f"Planar patch area is {ratio:.3f} times reference cap area"))
+            records.append(record)
+            continue
+
+        face_ids[region] = fid
+        assigned_names[fid] = name
+        n_done += 1
+        record["max_plane_error"] = float(
+            np.max(np.abs((centroids[region] - center) @ normal)))
+        record["min_normal_alignment"] = float(
+            np.min(np.abs(normals[region].astype(np.float64) @ normal)))
+        if reference_area > 0 and ratio < CLOSED_CAP_MIN_AREA_RATIO_WARNING:
+            record.update(status="PARTIAL", reason=(
+                f"Region covers only {ratio:.3f} of original cap area"))
+        else:
+            record["status"] = "ASSIGNED"
+        center_found = np.mean(centroids[region], axis=0)
+        record["x"], record["y"], record["z"] = map(float, center_found)
+        records.append(record)
+
+        if n_done <= 5 or n_done % CLOSED_CAP_PRINT_EVERY == 0:
+            print(f"  [closed cap] {name} (fid {fid}): {len(region)} triangles; "
+                  f"area/reference={ratio:.3f}; {record['status']}")
+
+    unique_ids = set(int(v) for v in np.unique(face_ids))
+    expected_ids = set(assigned_names)
+    if unique_ids != expected_ids:
+        raise RuntimeError("Internal face ID/facenames disagreement: "
+                           f"mesh={unique_ids}, facenames={expected_ids}")
+    if not np.all(np.isin(face_ids, np.asarray(list(expected_ids)))):
+        raise RuntimeError("Unmapped ModelFaceID in output")
+
+    problematic = [r for r in records if r["status"] not in ("ASSIGNED",)]
+    print(f"  Closed cap assignment: {n_done}/{len(caps)} caps labeled; "
+          f"{len(problematic)} partial/ambiguous/missing; "
+          f"{int(np.count_nonzero(face_ids == wall_fid)):,} wall triangles")
+    for rec in problematic[:20]:
+        print(f"    WARNING {rec['name']}: {rec['status']} — {rec['reason']} "
+              f"XYZ=({rec['x']:.6g}, {rec['y']:.6g}, {rec['z']:.6g})")
+    if len(problematic) > 20:
+        print(f"    ... {len(problematic)-20} additional warnings in CSV")
+    return face_ids, assigned_names, records
+
+
+def write_closed_boolean_with_facenames(tm, caps, edge_length):
+    """Write the primary closed VTP with cell ModelFaceID and matching names."""
+    DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+    source_face_names = read_facenames(OLD_FACENAMES)
+    if not source_face_names:
+        raise RuntimeError(f"No face entries found in {OLD_FACENAMES}")
+    ids, names, records = assign_closed_boolean_cap_faces(
+        tm, caps, source_face_names, edge_length)
+    output_poly = tm_to_pv(tm)
+    output_poly.cell_data["ModelFaceID"] = ids
+    output_poly.save(CLOSED_BOOLEAN_OUTPUT_VTP)
+    write_facenames(CLOSED_BOOLEAN_OUTPUT_FACENAMES, names)
+
+    # Also report named reference caps whose ModelFaceID is entirely absent
+    # from the ORIGINAL healthy model, since extract_cap_info() skips them.
+    source_cap_ids = {fid for fid, label in source_face_names.items()
+                      if "wall" not in label.lower()}
+    extracted_cap_ids = {int(c["fid"]) for c in caps}
+    for fid in sorted(source_cap_ids - extracted_cap_ids):
+        records.append({
+            "name": source_face_names[fid], "fid": fid,
+            "status": "MISSING_IN_SOURCE", "reason": (
+                "Face name exists in original .facenames but has no labeled "
+                "triangles in the original VTP"),
+            "triangles": 0,
+        })
+
+    report_path = DIAGNOSTIC_DIR / "closed_boolean_cap_assignment.csv"
+    _write_csv(report_path, records, [
+        "name", "fid", "status", "reason", "triangles", "reference_area",
+        "area_ratio", "max_plane_error", "min_normal_alignment",
+        "overlapping_candidates", "x", "y", "z",
+    ])
+    missing = [r["name"] for r in records
+               if r["status"] in ("MISSING", "AMBIGUOUS", "MISSING_IN_SOURCE")]
+    partial = [r["name"] for r in records if r["status"] == "PARTIAL"]
+    PIPELINE_REPORT["closed_cap_labels"] = {
+        "closed_vtp": str(CLOSED_BOOLEAN_OUTPUT_VTP),
+        "facenames": str(CLOSED_BOOLEAN_OUTPUT_FACENAMES),
+        "reference_cap_count": len(source_cap_ids),
+        "assigned_cap_count": len(source_cap_ids) - len(missing),
+        "missing_or_ambiguous_caps": missing,
+        "partially_matched_caps": partial,
+        "report_csv": str(report_path),
+        "warning": "Labels are geometric matches, not proof of cap watertightness or CFD meshability",
+    }
+    if missing or partial:
+        _status("closed_cap_assignment", (
+            f"Created labeled closed VTP; {len(missing)} missing/ambiguous "
+            f"and {len(partial)} partial cap labels. See {report_path}"), severity="warning")
+    else:
+        _status("closed_cap_assignment", (
+            f"Created labeled closed VTP and .facenames; "
+            f"{len(source_cap_ids)} cap labels matched"))
+    return output_poly
+
+
+# ============================================================
+# NON-FATAL BOUNDARY AND CAP DIAGNOSTICS
+# ============================================================
+
+def _write_csv(path, records, columns):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for record in records:
+            writer.writerow({key: record.get(key, "") for key in columns})
+
+
+def _save_pipeline_report():
+    DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+    (DIAGNOSTIC_DIR / "pipeline_report.json").write_text(
+        json.dumps(PIPELINE_REPORT, indent=2, default=str), encoding="utf-8"
+    )
+
+
+def _status(stage, message, *, severity="info"):
+    PIPELINE_REPORT["stages"].append({"stage": stage, "severity": severity,
+                                      "message": str(message)})
+    if severity == "warning":
+        PIPELINE_REPORT["warnings"].append(str(message))
+    elif severity == "error":
+        PIPELINE_REPORT["errors"].append(str(message))
+    print(f"  [{severity.upper()}] {stage}: {message}")
+    _save_pipeline_report()
+
+
+def _cap_matcher(caps):
+    centers = np.array([c["centroid"] for c in caps], dtype=np.float64)
+    normals = np.array([c["normal"] for c in caps], dtype=np.float64)
+    radii = np.array([max(float(c["radius"]), 1e-12) for c in caps])
+    # KDTree accelerates lookups on models with hundreds of caps. It is only
+    # used for diagnostics; missing SciPy is handled by a NumPy fallback.
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(centers)
+    except ImportError:
+        tree = None
+
+    def match(xyz, n=3):
+        if not caps:
+            return []
+        xyz = np.asarray(xyz, dtype=np.float64)
+        k = min(len(caps), max(n * 4, 10))
+        if tree is not None:
+            _, ids = tree.query(xyz, k=k)
+            ids = np.atleast_1d(ids).astype(np.int64)
+        else:
+            d2 = np.einsum('ij,ij->i', centers - xyz, centers - xyz)
+            ids = np.argsort(d2)[:k]
+        off = xyz - centers[ids]
+        axial = np.abs(np.einsum('ij,ij->i', off, normals[ids]))
+        lateral = np.linalg.norm(off - np.einsum('ij,ij->i', off, normals[ids])[:, None] * normals[ids], axis=1)
+        score = np.hypot(axial / radii[ids], lateral / radii[ids])
+        best = np.argsort(score)[:n]
+        return [{"name": str(caps[ids[j]]["name"]),
+                 "fid": int(caps[ids[j]]["fid"]),
+                 "distance": float(np.linalg.norm(off[j])),
+                 "plane_offset": float(axial[j]),
+                 "radial_offset": float(lateral[j]),
+                 "normalized_score": float(score[j])} for j in best]
+    return match
+
+
+def _make_point_markers(xyz, numeric_arrays, path):
+    xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    if len(xyz) == 0:
+        return
+    poly = pv.PolyData(xyz)
+    poly.verts = np.column_stack((np.ones(len(xyz), dtype=np.int64),
+                                  np.arange(len(xyz), dtype=np.int64))).ravel()
+    for key, val in numeric_arrays.items():
+        poly.point_data[key] = np.asarray(val)
+    poly.save(str(path))
+
+
+def boundary_diagnostics(tm, caps, stage, *, export=True):
+    """Analyze open edges, branching boundary vertices, and opening components.
+
+    Never raises due to malformed boundary topology. Reports coordinates of
+    degree != 2 vertices (pinched/touching/crossing boundary cycles) and the
+    nearest reference caps. A nearest cap is a clue, NOT proof of causation.
+    """
+    verts = np.asarray(tm.vertices, dtype=np.float64)
+    faces = np.asarray(tm.faces, dtype=np.int64)
+    # This process is vectorized even for multi-million-cell models.
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges.sort(axis=1)
+    unique, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary_edges = unique[counts == 1]
+    nonmanifold_edges = unique[counts > 2]
+    del edges, unique, counts
+
+    degree = np.bincount(boundary_edges.ravel(), minlength=len(verts))
+    bad = np.flatnonzero((degree > 0) & (degree != 2))
+    match = _cap_matcher(caps)
+    stage_dir = DIAGNOSTIC_DIR / stage
+    if export:
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+    # Connected components of the 1D boundary graph. Components can contain
+    # two or more merged loops if one vertex has degree 4 (figure-eight).
+    graph = defaultdict(list)
+    for a, b in boundary_edges:
+        a, b = int(a), int(b)
+        graph[a].append(b)
+        graph[b].append(a)
+    components = []
+    component_of_vertex = {}
+    for root in graph:
+        if root in component_of_vertex:
+            continue
+        component_id = len(components) + 1
+        queue = deque([root])
+        component_of_vertex[root] = component_id
+        members = []
+        while queue:
+            v = queue.popleft()
+            members.append(v)
+            for nb in graph[v]:
+                if nb not in component_of_vertex:
+                    component_of_vertex[nb] = component_id
+                    queue.append(nb)
+        components.append(members)
+
+    component_rows = []
+    for i, members in enumerate(components, start=1):
+        ids = np.asarray(members, dtype=np.int64)
+        xyz = verts[ids]
+        center = xyz.mean(axis=0)
+        degree_bad = ids[degree[ids] != 2]
+        nearest = match(center, n=3)
+        # Vertex-wise matching helps identify TWO caps meeting at a degree-4
+        # junction (component centroid alone might not reveal both).
+        suspicious_names = set()
+        for bad_id in degree_bad[:20]:
+            for m in match(verts[int(bad_id)], n=2):
+                suspicious_names.add(m["name"])
+        component_rows.append({
+            "component_id": i, "vertices": int(len(ids)),
+            "boundary_edges": int(sum(len(graph[j]) for j in members) // 2),
+            "bad_degree_vertices": int(len(degree_bad)),
+            "max_degree": int(degree[ids].max()),
+            "closed_simple_loop": int(len(degree_bad) == 0),
+            "x": float(center[0]), "y": float(center[1]), "z": float(center[2]),
+            "min_x": float(xyz[:, 0].min()), "max_x": float(xyz[:, 0].max()),
+            "min_y": float(xyz[:, 1].min()), "max_y": float(xyz[:, 1].max()),
+            "min_z": float(xyz[:, 2].min()), "max_z": float(xyz[:, 2].max()),
+            "nearest_cap": nearest[0]["name"] if nearest else "",
+            "nearest_cap_fid": nearest[0]["fid"] if nearest else -1,
+            "cap_candidates": "; ".join(sorted(suspicious_names)) or "; ".join(m["name"] for m in nearest),
+            "nearest_cap_score": nearest[0]["normalized_score"] if nearest else "",
+        })
+
+    bad_rows = []
+    nearest_ids = []
+    group_ids = []
+    for vid in bad:
+        near = match(verts[int(vid)], n=3)
+        p = verts[int(vid)]
+        cid = component_of_vertex.get(int(vid), -1)
+        nearest_ids.append(near[0]["fid"] if near else -1)
+        group_ids.append(cid)
+        bad_rows.append({
+            "vertex_id": int(vid), "boundary_degree": int(degree[vid]),
+            "component_id": cid,
+            "x": float(p[0]), "y": float(p[1]), "z": float(p[2]),
+            "nearest_cap": near[0]["name"] if near else "",
+            "nearest_cap_fid": near[0]["fid"] if near else -1,
+            "nearest_cap_normalized_distance": near[0]["normalized_score"] if near else "",
+            "other_nearby_caps": "; ".join(c["name"] for c in near[1:]),
+        })
+
+    summary = {
+        "stage": stage, "faces": int(len(faces)), "vertices": int(len(verts)),
+        "boundary_edges": int(len(boundary_edges)),
+        "nonmanifold_edges": int(len(nonmanifold_edges)),
+        "boundary_components": int(len(components)),
+        "simple_closed_loops": int(sum(x["closed_simple_loop"] for x in component_rows)),
+        "bad_degree_vertices": int(len(bad)),
+        "expected_caps": int(len(caps)),
+        "safe_to_treat_as_clean_open_surface": bool(len(bad) == 0 and
+            len(nonmanifold_edges) == 0 and len(components) == len(caps) and
+            all(r["closed_simple_loop"] for r in component_rows)),
+    }
+    if export:
+        _write_csv(stage_dir / "boundary_components.csv", component_rows,
+                   ["component_id", "vertices", "boundary_edges", "bad_degree_vertices",
+                    "max_degree", "closed_simple_loop", "x", "y", "z",
+                    "min_x", "max_x", "min_y", "max_y", "min_z", "max_z",
+                    "nearest_cap", "nearest_cap_fid", "cap_candidates", "nearest_cap_score"])
+        _write_csv(stage_dir / "broken_boundary_vertices.csv", bad_rows,
+                   ["vertex_id", "boundary_degree", "component_id", "x", "y", "z",
+                    "nearest_cap", "nearest_cap_fid", "nearest_cap_normalized_distance", "other_nearby_caps"])
+        (stage_dir / "boundary_summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8")
+        if len(nonmanifold_edges):
+            edge_midpoints = verts[nonmanifold_edges].mean(axis=1)
+            nm_rows = []
+            cap_ids = []
+            for e, pt in zip(nonmanifold_edges, edge_midpoints):
+                near = match(pt, n=3)
+                fid = near[0]["fid"] if near else -1
+                cap_ids.append(fid)
+                nm_rows.append({"vertex_id_a": int(e[0]), "vertex_id_b": int(e[1]),
+                                "x": float(pt[0]), "y": float(pt[1]), "z": float(pt[2]),
+                                "nearest_cap": near[0]["name"] if near else "",
+                                "nearest_cap_fid": fid,
+                                "other_nearby_caps": "; ".join(m["name"] for m in near[1:])})
+            _write_csv(stage_dir / "nonmanifold_edge_locations.csv", nm_rows,
+                       ["vertex_id_a", "vertex_id_b", "x", "y", "z", "nearest_cap",
+                        "nearest_cap_fid", "other_nearby_caps"])
+            _make_point_markers(edge_midpoints, {
+                "OriginalVertexA": nonmanifold_edges[:, 0].astype(np.int64),
+                "OriginalVertexB": nonmanifold_edges[:, 1].astype(np.int64),
+                "NearestCapFID": np.asarray(cap_ids, dtype=np.int32),
+            }, stage_dir / "nonmanifold_edge_midpoints.vtp")
+        if len(bad):
+            _make_point_markers(verts[bad], {
+                "OriginalVertexID": bad.astype(np.int64),
+                "BoundaryDegree": degree[bad].astype(np.int32),
+                "ComponentID": np.array(group_ids, dtype=np.int32),
+                "NearestCapFID": np.array(nearest_ids, dtype=np.int32),
+            }, stage_dir / "broken_boundary_vertices.vtp")
+        if len(boundary_edges):
+            used = np.unique(boundary_edges)
+            local = np.searchsorted(used, boundary_edges)
+            lines = np.column_stack((np.full(len(local), 2, dtype=np.int64), local)).ravel()
+            poly = pv.PolyData(verts[used], lines=lines)
+            poly.point_data["OriginalVertexID"] = used.astype(np.int64)
+            poly.point_data["BoundaryDegree"] = degree[used].astype(np.int32)
+            poly.cell_data["ComponentID"] = np.array([
+                component_of_vertex[int(e[0])] for e in boundary_edges], dtype=np.int32)
+            poly.save(str(stage_dir / "boundary_edges.vtp"))
+        if len(components):
+            centers = [[r["x"], r["y"], r["z"]] for r in component_rows]
+            _make_point_markers(centers, {
+                "ComponentID": np.arange(1, len(components) + 1, dtype=np.int32),
+                "BadVertexCount": np.array([r["bad_degree_vertices"] for r in component_rows], dtype=np.int32),
+                "NearestCapFID": np.array([r["nearest_cap_fid"] for r in component_rows], dtype=np.int32),
+            }, stage_dir / "boundary_component_centers.vtp")
+
+        # Export a small set of context patches near the highest-priority bad
+        # components. Always use the original mesh for surgical/manual repair.
+        problem_rows = sorted((r for r in component_rows if r["bad_degree_vertices"]),
+                              key=lambda r: (-r["bad_degree_vertices"], r["component_id"]))
+        if problem_rows and DIAGNOSTIC_MAX_PATCHES > 0:
+            # Reuse one spatial index for all patches when SciPy is available.
+            tri_centers = verts[faces].mean(axis=1)
+            try:
+                from scipy.spatial import cKDTree
+                face_tree = cKDTree(tri_centers)
+            except ImportError:
+                face_tree = None
+            for row in problem_rows[:DIAGNOSTIC_MAX_PATCHES]:
+                xyz = np.array([row["x"], row["y"], row["z"]])
+                cap = next((c for c in caps if c["fid"] == row["nearest_cap_fid"]), None)
+                radius = max(2.0 * float(cap["radius"]) if cap else 0.0,
+                             float(np.linalg.norm(verts.max(axis=0) - verts.min(axis=0))) * 0.005)
+                radius *= DIAGNOSTIC_PATCH_RADIUS_MULTIPLIER
+                if face_tree is not None:
+                    chosen = np.asarray(face_tree.query_ball_point(xyz, radius), dtype=np.int64)
+                else:
+                    chosen = np.flatnonzero(np.linalg.norm(tri_centers - xyz, axis=1) <= radius)
+                if len(chosen) == 0:
+                    continue
+                patch_tm = trimesh.Trimesh(vertices=verts, faces=faces[chosen], process=False)
+                patch_tm.remove_unreferenced_vertices()
+                patch = tm_to_pv(patch_tm)
+                patch.save(str(stage_dir / f"component_{row['component_id']:04d}_context.vtp"))
+            del tri_centers
+
+    print(f"  [boundary {stage}] {summary['boundary_edges']} open edges | "
+          f"{summary['boundary_components']} components | "
+          f"{summary['bad_degree_vertices']} branch/touch vertices | "
+          f"{summary['nonmanifold_edges']} nonmanifold edges | "
+          f"expected {summary['expected_caps']} caps")
+    for r in sorted((r for r in component_rows if r["bad_degree_vertices"]),
+                    key=lambda r: -r["bad_degree_vertices"])[:12]:
+        print(f"    PROBLEM component {r['component_id']}: "
+              f"bad_vertices={r['bad_degree_vertices']} "
+              f"XYZ=({r['x']:.6g},{r['y']:.6g},{r['z']:.6g}) "
+              f"near {r['cap_candidates']}")
+    return summary
+
+
+def _save_open_candidate(tm, path=OUTPUT_VTP):
+    """Write a wall-only PolyData even when the boundaries need manual repair."""
+    poly = tm_to_pv(tm)
+    poly.cell_data["ModelFaceID"] = np.full(poly.n_cells, OPEN_WALL_FACE_ID, dtype=np.int32)
+    poly.save(str(path))
+    write_facenames(OUTPUT_FACENAMES, {OPEN_WALL_FACE_ID: "wall"})
+    return poly
+
+
+def _write_cap_reference(caps):
+    with open(CAP_REFERENCE_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "old_ModelFaceID", "centroid_x", "centroid_y", "centroid_z",
+                         "normal_x", "normal_y", "normal_z", "radius", "plane_tol"])
+        for cap in caps:
+            c, n = cap["centroid"], cap["normal"]
+            writer.writerow([cap["name"], cap["fid"], float(c[0]), float(c[1]), float(c[2]),
+                             float(n[0]), float(n[1]), float(n[2]),
+                             float(cap["radius"]), float(cap["plane_tol"])])
+
+
+def _save_cap_removal_table():
+    _write_csv(DIAGNOSTIC_DIR / "cap_removal_results.csv", CAP_REMOVAL_RECORDS,
+               ["name", "fid", "status", "reason", "triangles_removed", "seed_face",
+                "max_plane_error", "min_normal_alignment", "x", "y", "z"])
 
 
 # ============================================================
@@ -1399,6 +2071,12 @@ for i, tool_path in enumerate(TOOL_VTPS):
 
     tm_intermediate = repair(manifold_to_tm(mf_base))
 
+    if SAVE_EACH_BOOLEAN_STAGE:
+        DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+        stage_path = DIAGNOSTIC_DIR / f"boolean_after_tool_{i+1:02d}.vtp"
+        tm_to_pv(tm_intermediate).save(str(stage_path))
+        print(f"  Saved intermediate boolean result: {stage_path}")
+
     mf_base = tm_to_manifold(tm_intermediate)
     del tm_intermediate
 
@@ -1450,134 +2128,179 @@ del region_components
 
 tm_result = repair(tm_result)
 
-print("Assessing raw boolean surface before cap removal...")
-report_surface_discretization(tm_result, label="closed boolean pre-cap-removal")
+print("Assessing PRIMARY closed Boolean surface...")
+report_surface_discretization(tm_result, label="primary closed boolean")
 
 if WRITE_DEBUG_SURFACES:
     print(f"Writing pre-remesh diagnostic surface: {DEBUG_PRE_REMESH_VTP}")
     tm_to_pv(tm_result).save(DEBUG_PRE_REMESH_VTP)
 
-if not REBUILD_CAPS_FROM_SCRATCH:
+if GENERATE_OPEN_WALL_SECONDARY and not REBUILD_CAPS_FROM_SCRATCH:
     raise RuntimeError(
-        "This script version is intended to rebuild caps from scratch. "
-        "Set REBUILD_CAPS_FROM_SCRATCH=True."
+        "Secondary open-wall extraction requires "
+        "REBUILD_CAPS_FROM_SCRATCH=True."
     )
 
-print("Removing ALL legacy cap triangles...")
-tm_wall = strip_all_caps(tm_result, caps, target_remesh_edge)
-del tm_result
+# Write labeled PRIMARY closed output before any optional cap removal.
+# This checkpoint is preserved regardless of subsequent remeshing outcomes.
+DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Writing PRIMARY labeled closed subtraction result: {CLOSED_BOOLEAN_OUTPUT_VTP}")
+_write_cap_reference(caps)
+try:
+    write_closed_boolean_with_facenames(tm_result, caps, target_remesh_edge)
+except Exception as exc:
+    # Never lose the successfully subtracted geometry due to a labeling bug.
+    # Write a clearly identified wall-only fallback with matching .facenames.
+    _status("closed_cap_assignment", (
+        f"Cap face labeling failed: {type(exc).__name__}: {exc}. "
+        "Saving closed geometry with wall-only labels for inspection."),
+        severity="error")
+    traceback.print_exc()
+    source_names = read_facenames(OLD_FACENAMES)
+    wall_items = [(fid, nm) for fid, nm in source_names.items()
+                  if "wall" in nm.lower()]
+    fallback_wall_id, fallback_wall_name = (
+        wall_items[0] if len(wall_items) == 1
+        else (max(source_names, default=0) + 1, "wall"))
+    fallback_poly = tm_to_pv(tm_result)
+    fallback_poly.cell_data["ModelFaceID"] = np.full(
+        fallback_poly.n_cells, fallback_wall_id, dtype=np.int32)
+    fallback_poly.save(CLOSED_BOOLEAN_OUTPUT_VTP)
+    write_facenames(CLOSED_BOOLEAN_OUTPUT_FACENAMES,
+                    {fallback_wall_id: fallback_wall_name})
+    PIPELINE_REPORT["closed_cap_labels"] = {
+        "status": "FALLBACK_WALL_ONLY", "exception": repr(exc),
+        "warning": "Closed mesh is saved but cap labels are NOT assigned",
+    }
+_status("boolean_complete", (
+    f"Saved PRIMARY closed result: {CLOSED_BOOLEAN_OUTPUT_VTP}; "
+    f"facenames: {CLOSED_BOOLEAN_OUTPUT_FACENAMES}; "
+    f"cap references: {CAP_REFERENCE_CSV}"))
 
-loops_before = boundary_loops_from_trimesh(tm_wall)
-print(
-    f"Open wall after cap deletion: {len(loops_before)} boundary loops "
-    f"(expected {len(caps)})"
-)
+# Intermediate and final outcomes are recorded independently.
+last_good_wall = None
+pre_remesh_wall = None
+final_boundary = None
+open_surface_exported = False
 
-if WRITE_DEBUG_SURFACES:
-    print(f"Writing open-wall diagnostic surface: {DEBUG_OPEN_WALL_VTP}")
-    tm_to_pv(tm_wall).save(DEBUG_OPEN_WALL_VTP)
+if GENERATE_OPEN_WALL_SECONDARY:
+    try:
+        print("Removing ALL legacy cap triangles...")
+        tm_wall = strip_all_caps(tm_result, caps, target_remesh_edge)
+        del tm_result
+        _save_cap_removal_table()
 
-if ENABLE_UNIFORM_REMESH:
-    print("Uniformly remeshing OPEN wall surface...")
-    tm_wall = uniform_remesh_open_wall(tm_wall, target_remesh_edge)
-    report_surface_discretization(tm_wall, label="remeshed open wall")
+        # Export immediately, EVEN IF ITS OPENINGS ARE NOT SIMPLE LOOPS.
+        # Output is useful for manual repair; not necessarily SV-ready.
+        print(f"Saving provisional open wall: {OUTPUT_VTP}")
+        _save_open_candidate(tm_wall)
+        open_surface_exported = True
+        pre_remesh_wall = tm_wall
+
+        if WRITE_DEBUG_SURFACES:
+            tm_to_pv(tm_wall).save(DEBUG_OPEN_WALL_VTP)
+
+        before = boundary_diagnostics(tm_wall, caps, "post_cap_removal", export=DIAGNOSTICS_ENABLED)
+        unremoved_caps = [r["name"] for r in CAP_REMOVAL_RECORDS if r.get("status") != "REMOVED"]
+        if unremoved_caps:
+            # Topology can look normal even when a legacy cap was left in place.
+            # Such an output must never be advertised as SimVascular-ready.
+            before["caps_not_removed"] = unremoved_caps
+            before["safe_to_treat_as_clean_open_surface"] = False
+            _status("cap_removal", f"Failed to remove {len(unremoved_caps)} cap(s): "
+                    + ", ".join(unremoved_caps[:12])
+                    + (" ..." if len(unremoved_caps) > 12 else ""), severity="warning")
+            if DIAGNOSTICS_ENABLED:
+                (DIAGNOSTIC_DIR / "post_cap_removal" / "boundary_summary.json").write_text(
+                    json.dumps(before, indent=2), encoding="utf-8")
+        PIPELINE_REPORT["post_cap_removal"] = before
+        _save_pipeline_report()
+        _status("cap_removal", "Saved provisional open wall and cap-removal diagnostics"
+                + (" (boundary needs manual repair)" if not before["safe_to_treat_as_clean_open_surface"] else ""),
+                severity="warning" if not before["safe_to_treat_as_clean_open_surface"] else "info")
+
+        if not before["safe_to_treat_as_clean_open_surface"] and not TRY_REMESH_ON_INVALID_BOUNDARY:
+            print("\nSkipping ACVD remeshing: existing boundary is not made of simple, independent loops.")
+            print("Attempting remesh here could merge or distort multiple openings.")
+            final_boundary = before
+        else:
+            if ENABLE_UNIFORM_REMESH:
+                print("Uniformly remeshing OPEN wall surface...")
+                try:
+                    remeshed = uniform_remesh_open_wall(tm_wall, target_remesh_edge)
+                    if WRITE_DEBUG_SURFACES:
+                        tm_to_pv(remeshed).save(DEBUG_REMESHED_OPEN_WALL_VTP)
+                    after = boundary_diagnostics(remeshed, caps, "post_remesh", export=DIAGNOSTICS_ENABLED)
+                    PIPELINE_REPORT["post_remesh"] = after
+                    _save_pipeline_report()
+
+                    if after["safe_to_treat_as_clean_open_surface"] and not unremoved_caps:
+                        tm_wall = remeshed
+                        _save_open_candidate(tm_wall)
+                        final_boundary = after
+                        _status("remesh", "ACVD remeshed surface validated; saved as final OPEN VTP")
+                    else:
+                        # Never overwrite provisional open mesh with a topology-worse
+                        # remesh. Store it separately for visual investigation.
+                        probe_path = DIAGNOSTIC_DIR / "remeshed_unvalidated.vtp"
+                        tm_to_pv(remeshed).save(str(probe_path))
+                        final_boundary = before
+                        _status("remesh", f"ACVD output invalid. Kept pre-remesh open VTP; candidate saved to {probe_path}",
+                                severity="warning")
+                except Exception as exc:
+                    final_boundary = before
+                    _status("remesh", f"ACVD failed ({type(exc).__name__}: {exc}). Pre-remesh open VTP preserved.",
+                            severity="warning")
+                    traceback.print_exc()
+            else:
+                final_boundary = before
+                print("Uniform remeshing disabled; using provisional open wall.")
+
+    except Exception as exc:
+        # The subtraction and cap reference are already safe on disk.
+        # Keep a diagnostic of the exception rather than masking it.
+        _status("cap_pipeline", f"{type(exc).__name__}: {exc}; closed Boolean result preserved",
+                severity="error")
+        traceback.print_exc()
+        # If partial cap removal failed before returning, the last intact Boolean
+        # still exists as CLOSED_BOOLEAN_OUTPUT_VTP. Do not mislabel it as open.
+        if not open_surface_exported:
+            print("  No reliable open-wall extraction was available. Use the saved closed Boolean VTP.")
+
+    _save_cap_removal_table()
 else:
-    print("Uniform remeshing disabled; using cleaned open wall directly.")
+    print("Secondary open-wall extraction disabled; PRIMARY closed VTP is saved.")
 
-# Second hard validation gate: ACVD must preserve the 64 intended openings.
-loops_after = boundary_loops_from_trimesh(tm_wall)
-print(
-    f"Open wall after remeshing: {len(loops_after)} boundary loops "
-    f"(expected {len(caps)})"
-)
-if len(loops_after) != len(caps):
-    sizes = sorted((len(loop) for loop in loops_after), reverse=True)
-    raise RuntimeError(
-        f"Open-wall remeshing changed the boundary topology: "
-        f"{len(loops_after)} loops found, {len(caps)} expected. "
-        f"Largest loop sizes={sizes[:10]}."
+if not GENERATE_OPEN_WALL_SECONDARY:
+    labels = PIPELINE_REPORT.get("closed_cap_labels", {})
+    PIPELINE_REPORT["status"] = (
+        "closed_primary_cap_labels_failed" if labels.get("status") == "FALLBACK_WALL_ONLY"
+        else "closed_primary_requires_label_review" if (labels.get("missing_or_ambiguous_caps") or labels.get("partially_matched_caps"))
+        else "closed_primary_labeled"
     )
-print(
-    "  [post-remesh boundary validation] PASS: all intended openings "
-    "remain simple closed loops."
-)
+    print("\nPRIMARY output: labeled closed Boolean surface.")
+elif final_boundary is not None and final_boundary["safe_to_treat_as_clean_open_surface"]:
+    PIPELINE_REPORT["status"] = "closed_primary_and_open_wall_boundary_validated"
+    print("\nPASS: OPEN wall has the expected number of simple boundary loops.")
+    print("  NOTE: 3-D self-intersections are not proven absent; verify before meshing.")
+else:
+    PIPELINE_REPORT["status"] = "closed_primary_and_partial_open_output"
+    print("\nWARNING: Closed primary saved; OPEN wall requires manual repair/validation.")
 
-if WRITE_DEBUG_SURFACES:
-    print(
-        f"Writing remeshed open-wall diagnostic surface: "
-        f"{DEBUG_REMESHED_OPEN_WALL_VTP}"
-    )
-    tm_to_pv(tm_wall).save(DEBUG_REMESHED_OPEN_WALL_VTP)
-
-print("Preparing CLEAN OPEN-WALL surface for SimVascular capping...")
-
-# Convert the validated open wall to PolyData.  No external cap triangles are
-# added in this script: SimVascular will be responsible for capping the holes.
-pv_result = tm_to_pv(tm_wall)
-
-# The remaining surface is entirely wall.  Give every triangle a single
-# ModelFaceID so SimVascular sees a clean wall patch on import.
-pv_result.cell_data["ModelFaceID"] = np.full(
-    pv_result.n_cells,
-    OPEN_WALL_FACE_ID,
-    dtype=np.int32,
-)
-
-assignments = {OPEN_WALL_FACE_ID: "wall"}
-
-print(
-    f"Final OPEN surface: {pv_result.n_points} points | "
-    f"{pv_result.n_cells} cells | {len(loops_after)} openings"
-)
-print(
-    "  NOTE: watertight=False is EXPECTED here because the 64 caps have "
-    "intentionally been removed."
-)
-
-# Final sanity checks for the object that will actually be imported into SV.
-final_tm = pv_to_tm(pv_result)
-_report_mesh_quality(final_tm, label="final open wall for SimVascular")
-final_loops = boundary_loops_from_trimesh(final_tm)
-if len(final_loops) != len(caps):
-    raise RuntimeError(
-        f"Final export changed the number of openings: "
-        f"{len(final_loops)} found, {len(caps)} expected."
-    )
-print(
-    f"  [final export validation] PASS: {len(final_loops)} simple closed "
-    "boundary loops; every boundary vertex has degree 2."
-)
-
-# ============================================================
-# SAVE CLEAN OPEN SURFACE
-# ============================================================
-
-print("Writing CLEAN OPEN-WALL outputs...")
-pv_result.save(OUTPUT_VTP)
-write_facenames(OUTPUT_FACENAMES, assignments)
-
-# Save the original cap metadata so the caps created later in SimVascular can
-# be identified/renamed by position.
-with open(CAP_REFERENCE_CSV, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "name", "old_ModelFaceID",
-        "centroid_x", "centroid_y", "centroid_z",
-        "normal_x", "normal_y", "normal_z",
-        "radius", "plane_tol",
-    ])
-    for cap in caps:
-        c = cap["centroid"]
-        n = cap["normal"]
-        writer.writerow([
-            cap["name"], cap["fid"],
-            float(c[0]), float(c[1]), float(c[2]),
-            float(n[0]), float(n[1]), float(n[2]),
-            float(cap["radius"]), float(cap["plane_tol"]),
-        ])
-
-print("\nFinal assignment:")
-print(f"ModelFaceID={OPEN_WALL_FACE_ID} -> wall")
-print(f"Openings intentionally left uncapped: {len(final_loops)}")
-print(f"Cap reference metadata: {CAP_REFERENCE_CSV}")
-print("\nDONE - import the OPEN VTP into SimVascular and cap the openings there.")
+_save_pipeline_report()
+print("\n============================================")
+print("SAVED RESULTS")
+print("============================================")
+print("  PRIMARY closed model     :", CLOSED_BOOLEAN_OUTPUT_VTP)
+print("  PRIMARY closed facenames :", CLOSED_BOOLEAN_OUTPUT_FACENAMES)
+print("  Closed cap assignments   :", DIAGNOSTIC_DIR / "closed_boolean_cap_assignment.csv")
+if open_surface_exported:
+    print("  Best available OPEN wall  :", OUTPUT_VTP)
+    print("  OPEN wall facenames       :", OUTPUT_FACENAMES)
+print("  Original cap references  :", CAP_REFERENCE_CSV)
+print("  Diagnostics               :", DIAGNOSTIC_DIR.resolve())
+print("  Pipeline status           :", PIPELINE_REPORT["status"])
+if GENERATE_OPEN_WALL_SECONDARY:
+    print("\nFor degree-4 openings, inspect post_cap_removal/broken_boundary_vertices.csv")
+    print("and .vtp, and boundary_components.csv.")
+print("Geometric cap labels do not certify a watertight, intersection-free surface.")
