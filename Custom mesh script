@@ -16,8 +16,10 @@ BASE_VTP
 OLD_FACENAMES
     SimVascular .facenames file paired with BASE_VTP.
 RESULT_VTP
-    New CLOSED/watertight surface that should be volume meshed.  It does not
-    need ModelFaceID data; the script reassigns it from the reference caps.
+    New CLOSED/watertight surface that should be volume meshed.  Despite the
+    historical variable name, this can be any PyVista-readable polygonal
+    surface such as .vtp or a Meshmixer-exported .stl.  It does not need
+    ModelFaceID data; the script reassigns it from the reference caps.
 
 Primary output
 --------------
@@ -51,6 +53,11 @@ Notes
 * Gmsh is used only to generate the tetrahedral volume mesh.  Face identity is
   transferred back from the labelled input surface after meshing, which avoids
   relying on Gmsh's STL surface-patch numbering to match SimVascular faces.
+* The default Gmsh strategy PRESERVES the existing watertight STL triangles and
+  asks Gmsh only to fill the enclosed volume with tetrahedra.  This avoids the
+  classifySurfaces()/createGeometry() reparametrization step that can fail on
+  highly distorted STL triangles.  The older reparametrization workflow remains
+  available as an optional fallback.
 """
 
 from __future__ import annotations
@@ -73,6 +80,7 @@ import pyvista as pv
 
 BASE_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp"
 OLD_FACENAMES = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp.facenames"
+# Can be .vtp, .stl, or another PyVista-readable polygonal surface.
 RESULT_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result.vtp"
 
 # Labelled surface written for QC before Gmsh is called.
@@ -115,9 +123,32 @@ FACE_TRANSFER_WARN_FRACTION_OF_BBOX = 1.0e-4
 # GMSH SETTINGS
 # ============================================================================
 
-# Angle used by Gmsh to classify an imported STL into discrete surface patches.
-# This does NOT define the final SimVascular faces; those are transferred from
-# ModelFaceID after tetrahedralization.
+# Surface handling strategy:
+#   "preserve_first"  -> preserve the imported STL surface triangles and mesh
+#                        only the empty 3-D volume.  If that fails, optionally
+#                        fall back to the older STL reparametrization route.
+#   "preserve_only"   -> preserve-surface route only; never reparametrize.
+#   "reparameterize"  -> skip the preserve route and use the older
+#                        classifySurfaces()/createGeometry() workflow directly.
+#
+# For a watertight surface that already passed Meshmixer Inspector,
+# "preserve_first" is the recommended setting.
+GMSH_SURFACE_STRATEGY = "preserve_first"
+
+# Used only when GMSH_SURFACE_STRATEGY == "preserve_first".
+# If False, a failed preserve-surface attempt stops immediately instead of
+# spending time on the much more expensive reparametrization fallback.
+GMSH_ALLOW_REPARAMETERIZATION_FALLBACK = True
+
+# In preserve mode, tell Gmsh to mesh only entities that have no existing mesh.
+# The imported STL triangles already mesh the 2-D boundary, so this prevents
+# Gmsh from trying to regenerate/reparametrize them and leaves only the empty
+# discrete volume to tetrahedralize.
+GMSH_PRESERVE_MESH_ONLY_EMPTY = True
+
+# Angle used only by the optional reparametrization fallback.  It does NOT
+# define the final SimVascular faces; those are transferred from ModelFaceID
+# after tetrahedralization.
 GMSH_CLASSIFY_ANGLE_DEG = 40.0
 
 # 1 = Delaunay in Gmsh.  A good robust first choice for vascular geometries.
@@ -424,54 +455,213 @@ def _int32_checked(values: np.ndarray, name: str) -> np.ndarray:
 
 
 
+def _gmsh_count_elements(dim: int) -> int:
+    """Return the number of mesh elements currently classified in dimension dim."""
+    element_types, element_tag_blocks, _ = gmsh.model.mesh.getElements(dim)
+    return int(sum(len(tags) for tags in element_tag_blocks))
+
+
+
+def _configure_gmsh_mesh_options(*, preserve_surface: bool) -> None:
+    """Set common Gmsh mesh options for one meshing attempt."""
+
+    gmsh.option.setNumber("Mesh.Algorithm3D", float(GMSH_ALGORITHM_3D))
+    gmsh.option.setNumber("Mesh.ElementOrder", 1)
+    gmsh.option.setNumber("Mesh.SaveAll", 1)
+
+    # This is the key preserve-surface option.  In preserve mode the imported
+    # STL already contains the desired 2-D boundary mesh, so only the new 3-D
+    # discrete volume should be meshed.
+    gmsh.option.setNumber(
+        "Mesh.MeshOnlyEmpty",
+        1 if (preserve_surface and GMSH_PRESERVE_MESH_ONLY_EMPTY) else 0,
+    )
+
+    if GMSH_MIN_SIZE is not None:
+        gmsh.option.setNumber("Mesh.MeshSizeMin", float(GMSH_MIN_SIZE))
+    if GMSH_MAX_SIZE is not None:
+        gmsh.option.setNumber("Mesh.MeshSizeMax", float(GMSH_MAX_SIZE))
+
+
+
+def _prepare_preserved_stl_volume(stl_path: str):
+    """
+    Import the STL exactly as a discrete surface mesh and create a discrete
+    volume whose boundary is the imported surface entity/entities.
+
+    No classifySurfaces() and no createGeometry() are called here.  This means
+    Gmsh never has to construct a 2-D parametrization of the pulmonary surface.
+    """
+
+    gmsh.model.add("pulmonary_artery_preserved_surface")
+    gmsh.merge(stl_path)
+
+    surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
+    if not surface_tags:
+        raise RuntimeError("Gmsh imported no discrete surface entities from the STL.")
+
+    surface_elements_before = _gmsh_count_elements(2)
+    if surface_elements_before <= 0:
+        raise RuntimeError("The imported STL contains no 2-D surface elements.")
+
+    # A discrete entity is defined by its existing mesh.  Supplying the surface
+    # tags as the boundary of the new discrete volume gives Gmsh the topology it
+    # needs to fill the already-meshed shell without reparametrizing the shell.
+    volume_tag = gmsh.model.addDiscreteEntity(
+        3,
+        -1,
+        surface_tags,
+    )
+
+    pg = gmsh.model.addPhysicalGroup(3, [volume_tag])
+    gmsh.model.setPhysicalName(3, pg, "fluid")
+
+    _configure_gmsh_mesh_options(preserve_surface=True)
+
+    print("\nGmsh preserve-surface attempt")
+    print(f"  Imported surface entities : {len(surface_tags)}")
+    print(f"  Existing surface elements : {surface_elements_before}")
+    print("  Surface reparametrization : DISABLED")
+    print("  Mesh existing 2-D faces   : NO")
+    print("  Tetrahedralizing enclosed volume...")
+
+    gmsh.model.mesh.generate(3)
+    gmsh.model.mesh.setOrder(1)
+
+    surface_elements_after = _gmsh_count_elements(2)
+    if surface_elements_after != surface_elements_before:
+        print(
+            "  WARNING: 2-D surface element count changed from "
+            f"{surface_elements_before} to {surface_elements_after}."
+        )
+    else:
+        print("  Existing STL surface mesh was preserved.")
+
+    return volume_tag
+
+
+
+def _prepare_reparameterized_stl_volume(stl_path: str):
+    """Older Gmsh STL workflow retained as an optional fallback."""
+
+    gmsh.model.add("pulmonary_artery_reparameterized_surface")
+    gmsh.merge(stl_path)
+
+    angle = math.radians(GMSH_CLASSIFY_ANGLE_DEG)
+
+    print("\nGmsh reparametrization fallback")
+    print("  Running classifySurfaces()/createGeometry()...")
+
+    gmsh.model.mesh.classifySurfaces(
+        angle,
+        True,   # create boundary curves if needed
+        True,   # split enough for reparametrization
+        math.pi,
+    )
+    gmsh.model.mesh.createGeometry()
+
+    surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
+    if not surface_tags:
+        raise RuntimeError("Gmsh created no discrete surface entities.")
+
+    surface_loop = gmsh.model.geo.addSurfaceLoop(surface_tags)
+    volume_tag = gmsh.model.geo.addVolume([surface_loop])
+    gmsh.model.geo.synchronize()
+
+    pg = gmsh.model.addPhysicalGroup(3, [volume_tag])
+    gmsh.model.setPhysicalName(3, pg, "fluid")
+
+    _configure_gmsh_mesh_options(preserve_surface=False)
+
+    print(f"  Reparameterized surface entities: {len(surface_tags)}")
+    print("  Tetrahedralizing enclosed volume...")
+
+    gmsh.model.mesh.generate(3)
+    gmsh.model.mesh.setOrder(1)
+
+    return volume_tag
+
+
+
 def run_gmsh(stl_path: str, msh_path: str):
-    """Create a first-order tetrahedral mesh from the closed STL surface."""
+    """
+    Create a first-order tetrahedral mesh from the closed STL surface.
+
+    By default the existing STL triangles are preserved and Gmsh is asked only
+    to fill the empty 3-D volume.  The original surface-reparametrization route
+    can be used as a fallback or selected explicitly in the settings above.
+    """
+
+    valid_strategies = {
+        "preserve_first",
+        "preserve_only",
+        "reparameterize",
+    }
+
+    strategy = str(GMSH_SURFACE_STRATEGY).strip().lower()
+    if strategy not in valid_strategies:
+        raise ValueError(
+            "GMSH_SURFACE_STRATEGY must be one of: "
+            + ", ".join(sorted(valid_strategies))
+        )
+
+    if strategy == "preserve_only":
+        attempts = ["preserve"]
+    elif strategy == "reparameterize":
+        attempts = ["reparameterize"]
+    else:
+        attempts = ["preserve"]
+        if GMSH_ALLOW_REPARAMETERIZATION_FALLBACK:
+            attempts.append("reparameterize")
 
     gmsh.initialize()
 
     try:
         gmsh.option.setNumber("General.Terminal", 1 if GMSH_TERMINAL_OUTPUT else 0)
-        gmsh.model.add("pulmonary_artery")
 
-        gmsh.merge(stl_path)
+        failures = []
+        successful_mode = None
 
-        angle = math.radians(GMSH_CLASSIFY_ANGLE_DEG)
+        for attempt_number, mode in enumerate(attempts, start=1):
+            # A failed Gmsh meshing attempt can leave partial entities/elements in
+            # the model.  Start every strategy with a completely clean model.
+            gmsh.clear()
 
-        # Standard Gmsh discrete-STL workflow: classify the triangulated
-        # surface, create parametrized discrete geometry, then create a volume
-        # bounded by all resulting surface entities.
-        gmsh.model.mesh.classifySurfaces(
-            angle,
-            True,   # create boundary curves if needed
-            True,   # split enough for reparametrization
-            math.pi,
-        )
-        gmsh.model.mesh.createGeometry()
+            try:
+                if mode == "preserve":
+                    _prepare_preserved_stl_volume(stl_path)
+                else:
+                    _prepare_reparameterized_stl_volume(stl_path)
 
-        surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
-        if not surface_tags:
-            raise RuntimeError("Gmsh created no discrete surface entities.")
+                successful_mode = mode
+                break
 
-        surface_loop = gmsh.model.geo.addSurfaceLoop(surface_tags)
-        volume_tag = gmsh.model.geo.addVolume([surface_loop])
-        gmsh.model.geo.synchronize()
+            except Exception as exc:
+                failures.append((mode, str(exc)))
 
-        # Physical volume is useful if the .msh file is inspected elsewhere.
-        pg = gmsh.model.addPhysicalGroup(3, [volume_tag])
-        gmsh.model.setPhysicalName(3, pg, "fluid")
+                print("")
+                print("=" * 72)
+                print(f"GMSH {mode.upper()} ATTEMPT FAILED")
+                print("=" * 72)
+                print(str(exc))
 
-        gmsh.option.setNumber("Mesh.Algorithm3D", float(GMSH_ALGORITHM_3D))
-        gmsh.option.setNumber("Mesh.ElementOrder", 1)
-        gmsh.option.setNumber("Mesh.SaveAll", 1)
+                if attempt_number < len(attempts):
+                    print("\nTrying the configured fallback strategy...")
 
-        if GMSH_MIN_SIZE is not None:
-            gmsh.option.setNumber("Mesh.MeshSizeMin", float(GMSH_MIN_SIZE))
-        if GMSH_MAX_SIZE is not None:
-            gmsh.option.setNumber("Mesh.MeshSizeMax", float(GMSH_MAX_SIZE))
+        if successful_mode is None:
+            details = "\n".join(
+                f"  {mode}: {message}"
+                for mode, message in failures
+            )
+            raise RuntimeError(
+                "All configured Gmsh meshing strategies failed:\n" + details
+            )
 
-        print("\nGenerating Gmsh tetrahedral volume mesh...")
-        gmsh.model.mesh.generate(3)
-        gmsh.model.mesh.setOrder(1)
+        print("")
+        print("=" * 72)
+        print("GMSH VOLUME MESH CREATED")
+        print("=" * 72)
+        print(f"Successful surface strategy: {successful_mode}")
 
         if GMSH_OPTIMIZE_NETGEN:
             print("Optimizing tetrahedra with Netgen optimizer...")
