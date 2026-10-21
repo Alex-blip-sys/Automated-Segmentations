@@ -504,14 +504,27 @@ def _prepare_preserved_stl_volume(stl_path: str):
     if surface_elements_before <= 0:
         raise RuntimeError("The imported STL contains no 2-D surface elements.")
 
-    # A discrete entity is defined by its existing mesh.  Supplying the surface
-    # tags as the boundary of the new discrete volume gives Gmsh the topology it
-    # needs to fill the already-meshed shell without reparametrizing the shell.
-    volume_tag = gmsh.model.addDiscreteEntity(
-        3,
-        -1,
-        surface_tags,
-    )
+    # IMPORTANT: the imported STL surface is a DISCRETE 2-D entity, but the
+    # enclosing 3-D region should be created with Gmsh's built-in GEO kernel.
+    # Gmsh explicitly supports these hybrid models: a built-in CAD volume may
+    # use discrete surface entities on its boundary.  Creating a *discrete*
+    # volume here is not sufficient for Gmsh to generate tetrahedra; it can
+    # leave us with a model containing only the original STL triangles.
+    #
+    # We therefore make a built-in surface loop from the existing discrete
+    # surface(s), create a built-in volume, and synchronize.  MeshOnlyEmpty=1
+    # below keeps the existing STL triangles and asks Gmsh to mesh only the
+    # previously empty 3-D volume.
+    surface_loop = gmsh.model.geo.addSurfaceLoop(surface_tags)
+    volume_tag = gmsh.model.geo.addVolume([surface_loop])
+    gmsh.model.geo.synchronize()
+
+    # Sanity check: after synchronize there must be a true 3-D model entity.
+    volume_entities = gmsh.model.getEntities(3)
+    if not volume_entities:
+        raise RuntimeError(
+            "Failed to create a 3-D hybrid Gmsh volume from the preserved STL shell."
+        )
 
     pg = gmsh.model.addPhysicalGroup(3, [volume_tag])
     gmsh.model.setPhysicalName(3, pg, "fluid")
@@ -527,6 +540,18 @@ def _prepare_preserved_stl_volume(stl_path: str):
 
     gmsh.model.mesh.generate(3)
     gmsh.model.mesh.setOrder(1)
+
+    # Do not declare preserve-mode success unless Gmsh actually produced
+    # 3-D elements.  This catches the exact failure mode where meshing returns
+    # without an exception but the model still contains only surface triangles.
+    volume_elements_after = _gmsh_count_elements(3)
+    if volume_elements_after <= 0:
+        raise RuntimeError(
+            "Preserved STL shell was accepted, but Gmsh generated zero 3-D "
+            "elements. The hybrid volume was not tetrahedralized."
+        )
+
+    print(f"  3-D elements generated     : {volume_elements_after}")
 
     surface_elements_after = _gmsh_count_elements(2)
     if surface_elements_after != surface_elements_before:
