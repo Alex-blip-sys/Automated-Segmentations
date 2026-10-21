@@ -64,7 +64,7 @@ RADIUS_ARRAY = "Radius"
 # selected by VTK is plausibly the vessel surrounding this centerline.
 # The exact cut itself is made from the true plane/surface intersection;
 # it is NOT approximated by this circle.
-CUT_RADIUS_FACTOR = 1.85
+CUT_RADIUS_FACTOR = 1.35
 
 # When a side branch disappears from the trimmed centerline, move the
 # plane slightly INTO the removed branch so we are not cutting directly
@@ -224,7 +224,7 @@ TERMINAL_OFFSET_FRACTION = 0.0
 #
 # A modest positive value is usually preferable because it removes the old
 # distal tip/cap and leaves a real vessel cross-section for the exact VTK cut.
-OUTLET_OFFSET_FRACTION = 1.75
+OUTLET_OFFSET_FRACTION = 0.75
 
 # For IsOutlet cuts only: after vtkCutter finds the closest plane/surface
 # contour, require that contour to be reasonably local to the centerline
@@ -304,17 +304,60 @@ MESH_QUALITY_TRIANGLE_MEASURE = "AspectRatio"
 #
 # radial half-width must exceed the vessel radius so the box fully severs the
 # vessel rather than merely punching a rectangular side hole.
-QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR = 3.75
+QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR = 1.75
 
 # The box is centered at the nearest centerline location.  Therefore this
 # axial half-length also controls how far toward the parent vessel the new
 # retained opening is moved away from the bad elements.
-QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR = 3.25
+QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR = 1.25
 
 # Multiple disconnected bad-cell clusters can belong to the same spike.
 # If their proposed box centers are closer than this many local radii, merge
 # them into a single box to avoid repeatedly chopping the same location.
-QUALITY_BOX_MERGE_DISTANCE_FACTOR = 3.25
+QUALITY_BOX_MERGE_DISTANCE_FACTOR = 1.25
+
+# -------------------------------------------------------------------------
+# FINAL END-BOX SWEEP
+# -------------------------------------------------------------------------
+# After all centerline-driven exact cuts are finished, make one final
+# oriented Box Clip pass at EVERY intended terminal opening. This includes
+# removed side-branch ends, synthetic pruning-terminal ends, true IsOutlet
+# ends, and (when present) points marked by an IsTerminalEnd PointData array.
+#
+# The box is deliberately ONE-SIDED with respect to the desired cut plane:
+# its upstream face sits at the accepted/planned cut location and the box
+# extends only downstream. This removes overlapping triangles, tiny residual
+# caps, spikes, and distal fragments without unnecessarily moving the opening
+# farther toward the parent vessel.
+ENABLE_FINAL_END_BOX_SWEEP = True
+
+# Requested: endpoint boxes are 2x the current mesh-quality box size.
+END_BOX_SIZE_MULTIPLIER = 2.0
+END_BOX_RADIAL_HALF_WIDTH_FACTOR = (
+    QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR * END_BOX_SIZE_MULTIPLIER
+)
+END_BOX_AXIAL_HALF_LENGTH_FACTOR = (
+    QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR * END_BOX_SIZE_MULTIPLIER
+)
+
+# Prefer the robust branch-scale Radius when an endpoint Radius collapses near
+# an old cap. This prevents microscopic boxes on otherwise normal branches.
+END_BOX_USE_REFERENCE_RADIUS = True
+
+# If the nearest surviving surface is farther than this many robust radii
+# from the desired cut plane, assume the end was already removed and skip it.
+END_BOX_LOCALITY_FACTOR = 3.0
+
+# Optional explicit point marker. If absent, the script simply uses the
+# terminal definitions already inferred from the full-vs-trimmed tree.
+TERMINAL_END_ARRAY = "IsTerminalEnd"
+
+# Debug surface for the endpoint boxes actually attempted.
+END_BOXES_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Final_End_Boxes_Debug.vtp"
+
+# Open surface immediately after the endpoint-box sweep and before the final
+# Mesh Quality cleanup. Useful for isolating what the endpoint boxes changed.
+END_BOX_OPEN_OUTPUT_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_End_Box_Cleaned_Open.vtp"
 
 # A single cleanup pass is intentionally conservative.  The script reports
 # any Quality > threshold cells that remain afterward so they can be inspected
@@ -3655,6 +3698,370 @@ def extract_bad_quality_debug_surface(quality_surface, bad_ids):
     )
 
 
+def build_optional_terminal_end_box_cuts(centerline):
+    """Build box-only cut definitions from PointData TERMINAL_END_ARRAY."""
+
+    pd = centerline.GetPointData()
+    marker = pd.GetArray(TERMINAL_END_ARRAY)
+
+    if marker is None:
+        return []
+
+    radius_array = pd.GetArray(RADIUS_ARRAY)
+    if radius_array is None:
+        return []
+
+    is_outlet = pd.GetArray("IsOutlet")
+    cuts = []
+
+    for point_id in range(centerline.GetNumberOfPoints()):
+
+        if int(round(marker.GetTuple1(point_id))) != 1:
+            continue
+
+        # True IsOutlet points are already covered by outlet_cuts.
+        if (
+            is_outlet is not None
+            and int(round(is_outlet.GetTuple1(point_id))) == 1
+        ):
+            continue
+
+        cell_ids = vtk.vtkIdList()
+        centerline.GetPointCells(point_id, cell_ids)
+        endpoint_candidates = []
+
+        for j in range(cell_ids.GetNumberOfIds()):
+            cell_id = int(cell_ids.GetId(j))
+            cell = centerline.GetCell(cell_id)
+            n = cell.GetNumberOfPoints()
+
+            if n < 2:
+                continue
+
+            first_id = int(cell.GetPointId(0))
+            last_id = int(cell.GetPointId(n - 1))
+
+            if point_id == first_id:
+                endpoint_candidates.append((cell_id, int(cell.GetPointId(1)), 0))
+            elif point_id == last_id:
+                endpoint_candidates.append((cell_id, int(cell.GetPointId(n - 2)), -1))
+
+        if len(endpoint_candidates) == 0:
+            continue
+
+        source_cell_id, interior_id, endpoint_local_id = endpoint_candidates[0]
+        endpoint = point_tuple(centerline, point_id)
+        interior = point_tuple(centerline, interior_id)
+
+        direction = vec_sub(endpoint, interior)
+        if magnitude(direction) <= PLANE_EPS:
+            continue
+
+        normal = normalize(direction)
+
+        r0 = float(radius_array.GetTuple1(point_id))
+        r1 = float(radius_array.GetTuple1(interior_id))
+        valid_radii = [
+            r for r in (r0, r1)
+            if math.isfinite(r) and r > 0.0
+        ]
+
+        if len(valid_radii) == 0:
+            continue
+
+        radius = max(valid_radii)
+        reference_radius = robust_cell_reference_radius(
+            centerline,
+            source_cell_id,
+            radius_array
+        )
+
+        if reference_radius is None:
+            reference_radius = radius
+
+        cuts.append({
+            "type": "terminal_marker",
+            "center": endpoint,
+            "junction": endpoint,
+            "normal": normal,
+            "radius": radius,
+            "reference_radius": reference_radius,
+            "cut_radius": radius * CUT_RADIUS_FACTOR,
+            "source_cell_id": source_cell_id,
+            "source_endpoint_local_id": endpoint_local_id,
+            "source_point_id": point_id,
+            "removed_cell_ids": []
+        })
+
+    return cuts
+
+
+def get_end_box_radius(cut):
+    """Choose a robust physical radius for the final endpoint box."""
+
+    values = []
+
+    local_radius = cut.get("radius", None)
+    if (
+        local_radius is not None
+        and math.isfinite(float(local_radius))
+        and float(local_radius) > 0.0
+    ):
+        values.append(float(local_radius))
+
+    reference_radius = cut.get("reference_radius", None)
+    if (
+        END_BOX_USE_REFERENCE_RADIUS
+        and reference_radius is not None
+        and math.isfinite(float(reference_radius))
+        and float(reference_radius) > 0.0
+    ):
+        values.append(float(reference_radius))
+
+    if len(values) == 0:
+        return None
+
+    return max(values)
+
+
+def make_final_end_box_plan(cut, planned_cut_index):
+    """
+    Create a downstream-only box whose upstream face is the desired cut plane.
+    """
+
+    radius = get_end_box_radius(cut)
+    if radius is None:
+        return None
+
+    tangent = normalize(cut["normal"])
+    radial = radius * END_BOX_RADIAL_HALF_WIDTH_FACTOR
+    axial = radius * END_BOX_AXIAL_HALF_LENGTH_FACTOR
+
+    plane_center = cut["center"]
+
+    # Shift the box downstream by one half-length. Therefore its upstream face
+    # stays exactly at the accepted/planned cut location while the enlarged box
+    # extends outward over the terminal junk we want removed.
+    box_center = vec_add(
+        plane_center,
+        vec_scale(tangent, axial)
+    )
+
+    return {
+        "center": box_center,
+        "plane_center": plane_center,
+        "tangent": tangent,
+        "radius": radius,
+        "radial_half_width": radial,
+        "axial_half_length": axial,
+        "cut_type": cut.get("type", "end"),
+        "source_cell_id": int(cut.get("source_cell_id", -1)),
+        "source_point_id": int(cut.get("source_point_id", -1)),
+        "planned_cut_index": int(planned_cut_index),
+    }
+
+
+def make_end_box_debug_polydata(plan, box_index):
+    """Create an oriented cube for visual QC of the final endpoint sweep."""
+
+    radial = float(plan["radial_half_width"])
+    axial = float(plan["axial_half_length"])
+
+    cube = vtk.vtkCubeSource()
+    cube.SetBounds(-radial, radial, -radial, radial, -axial, axial)
+    cube.Update()
+
+    _, u, v = build_box_world_to_local_transform(
+        plan["center"],
+        plan["tangent"]
+    )
+
+    matrix = vtk.vtkMatrix4x4()
+    matrix.Identity()
+
+    for i in range(3):
+        matrix.SetElement(i, 0, u[i])
+        matrix.SetElement(i, 1, v[i])
+        matrix.SetElement(i, 2, plan["tangent"][i])
+        matrix.SetElement(i, 3, plan["center"][i])
+
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(matrix)
+
+    tf = vtk.vtkTransformPolyDataFilter()
+    tf.SetInputConnection(cube.GetOutputPort())
+    tf.SetTransform(transform)
+    tf.Update()
+
+    out = vtk.vtkPolyData()
+    out.DeepCopy(tf.GetOutput())
+
+    type_map = {
+        "side_branch": 1,
+        "terminal": 2,
+        "outlet": 3,
+        "terminal_marker": 4,
+    }
+
+    arrays = [
+        ("EndBoxIndex", int(box_index), vtk.vtkIntArray),
+        ("PlannedCutIndex", int(plan["planned_cut_index"]), vtk.vtkIntArray),
+        ("CutType", int(type_map.get(plan["cut_type"], 0)), vtk.vtkIntArray),
+        ("SourceCellId", int(plan["source_cell_id"]), vtk.vtkIntArray),
+        ("SourcePointId", int(plan["source_point_id"]), vtk.vtkIntArray),
+        ("LocalRadius", float(plan["radius"]), vtk.vtkDoubleArray),
+        ("RadialHalfWidth", float(plan["radial_half_width"]), vtk.vtkDoubleArray),
+        ("AxialHalfLength", float(plan["axial_half_length"]), vtk.vtkDoubleArray),
+    ]
+
+    for name, value, array_type in arrays:
+        arr = array_type()
+        arr.SetName(name)
+        arr.SetNumberOfTuples(out.GetNumberOfCells())
+        for i in range(out.GetNumberOfCells()):
+            arr.SetTuple1(i, value)
+        out.GetCellData().AddArray(arr)
+
+    return out
+
+
+def run_final_end_box_sweep(
+    surface,
+    all_planned_cuts,
+    accepted_cut_by_index,
+    extra_terminal_cuts,
+    inlet_xyz
+):
+    """
+    Apply a large downstream-only oriented box to every intended end.
+
+    Successful exact cuts use their ACTUAL accepted retry location. A skipped
+    exact cut uses the safest/deepest available retry location, allowing the
+    box pass to rescue difficult ends without requiring a valid oval contour.
+    """
+
+    working = vtk.vtkPolyData()
+    working.DeepCopy(surface)
+
+    locator_surface = vtk.vtkPolyData()
+    locator_surface.DeepCopy(surface)
+
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(locator_surface)
+    locator.BuildLocator()
+
+    planned_entries = []
+
+    for planned_index, planned_cut in enumerate(all_planned_cuts):
+
+        if planned_index in accepted_cut_by_index:
+            # Successful exact cut: place the final box at the ACTUAL accepted
+            # retry location, not the original plan.
+            chosen = accepted_cut_by_index[planned_index]
+
+        else:
+            # Exact cut was skipped. The box is our rescue mechanism, so use
+            # the safest/deepest available retry location instead of blindly
+            # returning to the original problematic plane.
+            retry_candidates = planned_cut.get("retry_candidates", [])
+
+            if len(retry_candidates) == 0:
+                chosen = planned_cut
+
+            elif planned_cut.get("type") == "side_branch":
+                # Farther INTO the branch being removed is safer than moving
+                # back toward its bifurcation with the retained tree.
+                chosen = max(
+                    retry_candidates,
+                    key=lambda c: float(
+                        c.get("retry_distance_from_anchor", 0.0)
+                    )
+                )
+
+            else:
+                # Terminal / IsOutlet retries are measured from the endpoint
+                # back toward the parent. Choose the farthest parentward
+                # available location to avoid tiny/overlapping terminal holes.
+                chosen = max(
+                    retry_candidates,
+                    key=lambda c: float(
+                        c.get("retry_distance_from_anchor", 0.0)
+                    )
+                )
+
+        planned_entries.append((planned_index, chosen))
+
+    base_count = len(all_planned_cuts)
+    for i, cut in enumerate(extra_terminal_cuts):
+        planned_entries.append((base_count + i, cut))
+
+    debug_boxes = []
+    applied = 0
+    locality_skips = 0
+    empty_skips = 0
+
+    for local_index, (planned_index, cut) in enumerate(planned_entries):
+
+        plan = make_final_end_box_plan(cut, planned_index)
+        if plan is None:
+            locality_skips += 1
+            continue
+
+        # Locality check uses the desired UPSTREAM FACE / cut plane location,
+        # not the box center shifted downstream.
+        nearest_id = locator.FindClosestPoint(plan["plane_center"])
+
+        if nearest_id < 0:
+            locality_skips += 1
+            continue
+
+        nearest = point_tuple(locator_surface, nearest_id)
+        nearest_distance = distance(nearest, plan["plane_center"])
+
+        if nearest_distance > END_BOX_LOCALITY_FACTOR * plan["radius"]:
+            locality_skips += 1
+            continue
+
+        candidate = clip_out_quality_box(working, plan)
+
+        if (
+            candidate.GetNumberOfPoints() == 0
+            or candidate.GetNumberOfCells() == 0
+        ):
+            empty_skips += 1
+            continue
+
+        working = candidate
+
+        debug_boxes.append(
+            make_end_box_debug_polydata(plan, applied)
+        )
+        applied += 1
+
+        if (
+            PROGRESS_PRINT_EVERY > 0
+            and (local_index + 1) % PROGRESS_PRINT_EVERY == 0
+        ):
+            print(
+                "Final end-box progress: {}/{} | applied={} skipped={}"
+                .format(
+                    local_index + 1,
+                    len(planned_entries),
+                    applied,
+                    locality_skips + empty_skips
+                )
+            )
+
+    # Discard all distal pieces severed by the endpoint boxes in one pass.
+    working = keep_inlet_connected_region(working, inlet_xyz)
+    working = clean_polydata(working, MERGE_TOLERANCE)
+    working = triangulate_polydata(working)
+
+    debug = append_polydata_list(debug_boxes, clean_result=False)
+
+    return working, debug, applied, locality_skips, empty_skips
+
+
 def run_mesh_quality_spike_cleanup(surface, centerline, inlet_xyz):
     """
     Detect Quality > threshold cells, group them, build oriented clipping boxes
@@ -4053,6 +4460,7 @@ successful_cut_indices = []
 skipped_pruning_cut_indices = []
 skipped_outlet_cut_indices = []
 failed_cut_attempts = []
+accepted_cut_by_index = {}
 
 print("")
 print("============================================")
@@ -4108,6 +4516,7 @@ for cut_index, cut in enumerate(pruning_cuts):
         successful_cut_indices.append(
             cut_index
         )
+        accepted_cut_by_index[cut_index] = dict(used_cut)
 
         if VERBOSE_CUT_LOG:
             print("    Target loop points:", stats["num_loop_points"])
@@ -4272,6 +4681,7 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
         successful_cut_indices.append(
             cut_index
         )
+        accepted_cut_by_index[cut_index] = dict(used_cut)
 
         outlet_success_count += 1
 
@@ -4479,6 +4889,64 @@ print(OUTPUT_OPEN_FILE)
 
 
 # ============================================================
+# FINAL END-BOX SAFETY SWEEP
+# ============================================================
+
+optional_terminal_end_cuts = build_optional_terminal_end_box_cuts(
+    trimmed_centerline
+)
+
+end_box_open = final_open
+end_boxes_debug = vtk.vtkPolyData()
+end_box_applied_count = 0
+end_box_locality_skips = 0
+end_box_empty_skips = 0
+
+if ENABLE_FINAL_END_BOX_SWEEP:
+
+    print("")
+    print("============================================")
+    print("FINAL END-BOX SAFETY SWEEP")
+    print("============================================")
+    print(
+        "Endpoint box half-widths: radial={:.2f} R, axial={:.2f} R"
+        .format(
+            END_BOX_RADIAL_HALF_WIDTH_FACTOR,
+            END_BOX_AXIAL_HALF_LENGTH_FACTOR
+        )
+    )
+
+    (
+        end_box_open,
+        end_boxes_debug,
+        end_box_applied_count,
+        end_box_locality_skips,
+        end_box_empty_skips
+    ) = run_final_end_box_sweep(
+        final_open,
+        all_planned_cuts,
+        accepted_cut_by_index,
+        optional_terminal_end_cuts,
+        inlet_xyz
+    )
+
+    if REGENERATE_GLOBAL_IDS:
+        regenerate_global_ids(end_box_open)
+
+    if end_boxes_debug.GetNumberOfCells() > 0:
+        write_polydata(end_boxes_debug, END_BOXES_DEBUG_FILE)
+
+    write_polydata(end_box_open, END_BOX_OPEN_OUTPUT_FILE)
+
+    print("Endpoint boxes applied:", end_box_applied_count)
+    print("Endpoint boxes skipped by locality:", end_box_locality_skips)
+    print("Endpoint boxes skipped because result was empty:", end_box_empty_skips)
+    print("Additional IsTerminalEnd markers:", len(optional_terminal_end_cuts))
+    print("Endpoint-box debug file:", END_BOXES_DEBUG_FILE)
+    print("Endpoint-box open surface:", END_BOX_OPEN_OUTPUT_FILE)
+
+
+# ============================================================
 # ADD FLAT CAPS
 #
 # The caps are created from the exact vtkCutter loops. Therefore their
@@ -4488,7 +4956,7 @@ print(OUTPUT_OPEN_FILE)
 
 # Quality cleanup always starts from the OPEN surface.  The capped output
 # below is optional and never feeds back into the final cleaned-open model.
-quality_cleanup_input = final_open
+quality_cleanup_input = end_box_open
 
 if WRITE_CAPPED_OUTPUT:
 
@@ -4679,6 +5147,8 @@ print("Pruning cuts completed:", len(pruning_cuts))
 print("IsOutlet cuts planned:", len(outlet_cuts))
 print("IsOutlet cuts completed:", outlet_success_count)
 print("IsOutlet cuts skipped:", outlet_skip_count)
+print("Final endpoint boxes applied:", end_box_applied_count)
+print("Final endpoint-box locality skips:", end_box_locality_skips)
 
 print("")
 print("============================================")
