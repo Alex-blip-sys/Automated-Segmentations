@@ -32,6 +32,33 @@ OUTPUT_OPEN_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmona
 # Exact-clipped PA tree with flat triangulated caps added at the new cuts.
 OUTPUT_CAPPED_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Pruned_Exact_Capped.vtp"
 
+# Matching SimVascular face-name file written beside the FINAL capped model.
+# Format is intentionally the same as the supplied .vtp.facenames example:
+#   set gPolyDataFaceNames(1) Wall
+#   set gPolyDataFaceNames(2) noname_2
+#   ...
+OUTPUT_CAPPED_FACENAMES = OUTPUT_CAPPED_FILE + ".facenames"
+
+# Debug copy of the final boundary loops that are capped after ALL clipping
+# and mesh-quality cleanup has finished.
+FINAL_CAP_LOOPS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Final_Cap_Loops_Debug.vtp"
+
+# Build caps only after the final endpoint-box and quality-cleanup passes.
+# This is deliberately different from the older workflow, which capped the
+# pre-cleanup cut loops and could therefore create caps that no longer matched
+# the actual final opening.
+FINAL_CAP_WALL_FACE_ID = 1
+FINAL_CAP_FACE_NAME_PREFIX = "noname_"
+
+# Radial-ring caps avoid the long polygon diagonals / tiny ear-clipping slivers
+# that can appear with vtkContourTriangulator on large irregular loops.
+# 0 = simple center fan; 1-3 adds concentric interior rings and usually gives
+# much more regular planar triangles.
+FINAL_CAP_INTERIOR_RINGS = 2
+
+# Warn if a generated cap triangle is extremely skinny by simple edge ratio.
+FINAL_CAP_EDGE_RATIO_WARN = 25.0
+
 # Debug output: the intended circular search/QC disk for every cut.
 CUTS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Cuts_Debug.vtp"
 
@@ -3075,6 +3102,424 @@ def get_next_model_face_id(surface):
 
 
 # ============================================================
+# FINAL CAP + SIMVASCULAR FACENAME HELPERS
+# ============================================================
+
+def write_facenames_file(path, assignments):
+    """Write the Tcl-style SimVascular .facenames sidecar file."""
+
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    with open(path, "w", newline="\n") as f:
+        f.write("global gPolyDataFaceNames\n\n")
+        for fid in sorted(assignments):
+            f.write(
+                "set gPolyDataFaceNames({}) {}\n".format(
+                    int(fid), assignments[fid]
+                )
+            )
+
+
+def set_uniform_model_face_id(surface, face_id):
+    """Replace ModelFaceID on every cell of a PolyData surface."""
+
+    out = vtk.vtkPolyData()
+    out.DeepCopy(surface)
+
+    out.GetCellData().RemoveArray("ModelFaceID")
+
+    arr = vtk.vtkIntArray()
+    arr.SetName("ModelFaceID")
+    arr.SetNumberOfComponents(1)
+    arr.SetNumberOfTuples(out.GetNumberOfCells())
+    arr.FillComponent(0, int(face_id))
+    out.GetCellData().AddArray(arr)
+
+    return out
+
+
+def extract_final_boundary_loops(surface):
+    """
+    Return one ordered vtkPolyData polyline per physical open boundary.
+
+    The final model is already triangulated. vtkFeatureEdges extracts only
+    boundary edges; vtkStripper joins each connected ring into one polyline.
+    """
+
+    edges = vtk.vtkFeatureEdges()
+    edges.SetInputData(surface)
+    edges.BoundaryEdgesOn()
+    edges.FeatureEdgesOff()
+    edges.ManifoldEdgesOff()
+    edges.NonManifoldEdgesOff()
+    edges.Update()
+
+    boundary = vtk.vtkPolyData()
+    boundary.DeepCopy(edges.GetOutput())
+    boundary = clean_polydata(boundary, MERGE_TOLERANCE)
+
+    stripper = vtk.vtkStripper()
+    stripper.SetInputData(boundary)
+    stripper.JoinContiguousSegmentsOn()
+    stripper.Update()
+
+    stripped = vtk.vtkPolyData()
+    stripped.DeepCopy(stripper.GetOutput())
+
+    loops = []
+
+    for cell_id in range(stripped.GetNumberOfCells()):
+        cell = stripped.GetCell(cell_id)
+        if cell is None or cell.GetNumberOfPoints() < 3:
+            continue
+
+        ordered = []
+        for j in range(cell.GetNumberOfPoints()):
+            ordered.append(
+                point_tuple(stripped, cell.GetPointId(j))
+            )
+
+        # vtkStripper normally repeats the first point for a closed ring.
+        if (
+            len(ordered) >= 2
+            and distance(ordered[0], ordered[-1])
+                <= max(10.0 * MERGE_TOLERANCE, 1.0e-10)
+        ):
+            ordered = ordered[:-1]
+
+        if len(ordered) < 3:
+            continue
+
+        # Require a geometrically closed ring.  A non-closed boundary here is
+        # more useful as an explicit error than as a silently malformed cap.
+        closing_gap = distance(ordered[0], ordered[-1])
+        edge_lengths = [
+            distance(ordered[k], ordered[(k + 1) % len(ordered)])
+            for k in range(len(ordered))
+        ]
+        positive_edges = [e for e in edge_lengths if e > PLANE_EPS]
+        typical_edge = median_value(positive_edges) if positive_edges else 0.0
+
+        # For an ordered closed polygon the last->first edge is expected and
+        # can be much larger than MERGE_TOLERANCE because the repeated first
+        # point was removed above.  The topology was already established by
+        # vtkStripper, so we simply construct that final closing edge below.
+
+        pts = vtk.vtkPoints()
+        for p in ordered:
+            pts.InsertNextPoint(p)
+
+        polyline = vtk.vtkPolyLine()
+        polyline.GetPointIds().SetNumberOfIds(len(ordered) + 1)
+        for k in range(len(ordered)):
+            polyline.GetPointIds().SetId(k, k)
+        polyline.GetPointIds().SetId(len(ordered), 0)
+
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(polyline)
+
+        loop = vtk.vtkPolyData()
+        loop.SetPoints(pts)
+        loop.SetLines(cells)
+
+        centroid = (
+            sum(p[0] for p in ordered) / float(len(ordered)),
+            sum(p[1] for p in ordered) / float(len(ordered)),
+            sum(p[2] for p in ordered) / float(len(ordered)),
+        )
+
+        loops.append({
+            "polydata": loop,
+            "points": ordered,
+            "centroid": centroid,
+            "typical_edge": typical_edge,
+        })
+
+    return loops
+
+
+def newell_polygon_normal(points):
+    """Stable polygon normal for an ordered nearly planar boundary loop."""
+
+    nx = ny = nz = 0.0
+    n = len(points)
+    for i in range(n):
+        p = points[i]
+        q = points[(i + 1) % n]
+        nx += (p[1] - q[1]) * (p[2] + q[2])
+        ny += (p[2] - q[2]) * (p[0] + q[0])
+        nz += (p[0] - q[0]) * (p[1] + q[1])
+
+    normal = (nx, ny, nz)
+    if magnitude(normal) <= PLANE_EPS:
+        return None
+    return normalize(normal)
+
+
+def build_radial_ring_cap(boundary_points, interior_rings=2):
+    """
+    Build a planar cap using concentric rings interpolated between the loop
+    centroid and the exact wall boundary.
+
+    This keeps every OUTER boundary point unchanged, so the cap welds exactly
+    to the final open surface, while avoiding long ear-clipping diagonals that
+    can generate one large triangle plus tiny sliver triangles.
+    """
+
+    ordered = list(boundary_points)
+    n = len(ordered)
+    if n < 3:
+        raise RuntimeError("Cannot cap a boundary with fewer than 3 points.")
+
+    normal = newell_polygon_normal(ordered)
+    if normal is None:
+        raise RuntimeError("Boundary loop is degenerate; cap normal is undefined.")
+
+    center = (
+        sum(p[0] for p in ordered) / float(n),
+        sum(p[1] for p in ordered) / float(n),
+        sum(p[2] for p in ordered) / float(n),
+    )
+
+    num_rings = max(0, int(interior_rings))
+
+    pts = vtk.vtkPoints()
+    center_id = pts.InsertNextPoint(center)
+
+    ring_ids = []
+
+    # Interior rings, from center outward.
+    for ring_index in range(1, num_rings + 1):
+        frac = float(ring_index) / float(num_rings + 1)
+        ids = []
+        for p in ordered:
+            rp = vec_add(center, vec_scale(vec_sub(p, center), frac))
+            ids.append(pts.InsertNextPoint(rp))
+        ring_ids.append(ids)
+
+    # Exact outer boundary is always the final ring.
+    outer_ids = [pts.InsertNextPoint(p) for p in ordered]
+    ring_ids.append(outer_ids)
+
+    polys = vtk.vtkCellArray()
+
+    # Center fan to the innermost ring.
+    first_ring = ring_ids[0]
+    for i in range(n):
+        j = (i + 1) % n
+        tri = vtk.vtkTriangle()
+        tri.GetPointIds().SetId(0, center_id)
+        tri.GetPointIds().SetId(1, first_ring[i])
+        tri.GetPointIds().SetId(2, first_ring[j])
+        polys.InsertNextCell(tri)
+
+    # Two triangles per quad between successive rings.
+    for r in range(len(ring_ids) - 1):
+        inner = ring_ids[r]
+        outer = ring_ids[r + 1]
+
+        for i in range(n):
+            j = (i + 1) % n
+
+            tri1 = vtk.vtkTriangle()
+            tri1.GetPointIds().SetId(0, inner[i])
+            tri1.GetPointIds().SetId(1, outer[i])
+            tri1.GetPointIds().SetId(2, outer[j])
+            polys.InsertNextCell(tri1)
+
+            tri2 = vtk.vtkTriangle()
+            tri2.GetPointIds().SetId(0, inner[i])
+            tri2.GetPointIds().SetId(1, outer[j])
+            tri2.GetPointIds().SetId(2, inner[j])
+            polys.InsertNextCell(tri2)
+
+    cap = vtk.vtkPolyData()
+    cap.SetPoints(pts)
+    cap.SetPolys(polys)
+    cap = triangulate_polydata(cap)
+
+    return cap
+
+
+def cap_edge_ratio_stats(cap):
+    """Return maximum longest-edge/shortest-edge ratio over cap triangles."""
+
+    worst = 1.0
+    for cid in range(cap.GetNumberOfCells()):
+        cell = cap.GetCell(cid)
+        if cell is None or cell.GetNumberOfPoints() != 3:
+            continue
+
+        p0 = point_tuple(cap, cell.GetPointId(0))
+        p1 = point_tuple(cap, cell.GetPointId(1))
+        p2 = point_tuple(cap, cell.GetPointId(2))
+
+        lengths = [
+            distance(p0, p1),
+            distance(p1, p2),
+            distance(p2, p0),
+        ]
+        shortest = min(lengths)
+        longest = max(lengths)
+        if shortest <= PLANE_EPS:
+            return float("inf")
+        worst = max(worst, longest / shortest)
+
+    return worst
+
+
+def boundary_edge_count(surface):
+    edges = vtk.vtkFeatureEdges()
+    edges.SetInputData(surface)
+    edges.BoundaryEdgesOn()
+    edges.FeatureEdgesOff()
+    edges.ManifoldEdgesOff()
+    edges.NonManifoldEdgesOff()
+    edges.Update()
+    return edges.GetOutput().GetNumberOfCells()
+
+
+def build_final_capped_face_model(open_surface, inlet_xyz, accepted_cuts):
+    """
+    Cap every ACTUAL final boundary loop, stamp ModelFaceID, and return
+    (capped_surface, assignments, loop_debug).
+
+    Face 1 is always Wall.  Boundary loops are assigned IDs 2..N.  The loop
+    nearest the inlet is assigned first; the rest are ordered by proximity to
+    the accepted centerline-driven cut locations.  This gives stable face IDs
+    tied to the geometry we actually cut rather than to arbitrary VTK cell
+    order.
+    """
+
+    loops = extract_final_boundary_loops(open_surface)
+    if not loops:
+        raise RuntimeError(
+            "Final open surface has no boundary loops to cap."
+        )
+
+    # Reference centers from successful cuts.  These are used only to make the
+    # cap ordering deterministic and anatomically tied to the cut locations.
+    cut_refs = []
+    for key, cut in accepted_cuts.items():
+        if cut is None or cut.get("center") is None:
+            continue
+        cut_refs.append((int(key), cut))
+
+    # Inlet first.
+    inlet_loop_index = min(
+        range(len(loops)),
+        key=lambda i: distance(loops[i]["centroid"], inlet_xyz)
+    )
+
+    remaining = [i for i in range(len(loops)) if i != inlet_loop_index]
+
+    def loop_sort_key(i):
+        if not cut_refs:
+            c = loops[i]["centroid"]
+            return (float("inf"), c[0], c[1], c[2])
+
+        best = None
+        for planned_index, cut in cut_refs:
+            d = distance(loops[i]["centroid"], cut["center"])
+            candidate = (d, planned_index)
+            if best is None or candidate < best:
+                best = candidate
+        return (best[1], best[0])
+
+    remaining.sort(key=loop_sort_key)
+    ordered_indices = [inlet_loop_index] + remaining
+
+    wall = set_uniform_model_face_id(
+        triangulate_polydata(open_surface),
+        FINAL_CAP_WALL_FACE_ID
+    )
+
+    assignments = {
+        int(FINAL_CAP_WALL_FACE_ID): "Wall"
+    }
+
+    cap_surfaces = []
+    debug_loops = []
+
+    for ordinal, loop_index in enumerate(ordered_indices, start=2):
+        info = loops[loop_index]
+        face_id = int(ordinal)
+
+        cap = build_radial_ring_cap(
+            info["points"],
+            FINAL_CAP_INTERIOR_RINGS
+        )
+
+        cap = make_cap_compatible_with_surface(
+            cap,
+            wall,
+            face_id
+        )
+
+        cap_surfaces.append(cap)
+
+        assignments[face_id] = (
+            FINAL_CAP_FACE_NAME_PREFIX + str(face_id)
+        )
+
+        debug_loop = vtk.vtkPolyData()
+        debug_loop.DeepCopy(info["polydata"])
+
+        fid_arr = vtk.vtkIntArray()
+        fid_arr.SetName("ModelFaceID")
+        fid_arr.SetNumberOfTuples(debug_loop.GetNumberOfCells())
+        fid_arr.FillComponent(0, face_id)
+        debug_loop.GetCellData().AddArray(fid_arr)
+        debug_loops.append(debug_loop)
+
+        worst_ratio = cap_edge_ratio_stats(cap)
+        if worst_ratio > FINAL_CAP_EDGE_RATIO_WARN:
+            print(
+                "  WARNING: final cap fid={} has max edge ratio {:.2f}"
+                .format(face_id, worst_ratio)
+            )
+
+    capped = append_polydata_list(
+        [wall] + cap_surfaces,
+        clean_result=True
+    )
+    capped = triangulate_polydata(capped)
+
+    # If any cap failed to weld to the exact outer loop, do not silently write
+    # a supposedly watertight model.
+    remaining_boundary_edges = boundary_edge_count(capped)
+    if remaining_boundary_edges != 0:
+        raise RuntimeError(
+            "Final capped model is not watertight: {} boundary edges remain."
+            .format(remaining_boundary_edges)
+        )
+
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputData(capped)
+    normals.ConsistencyOn()
+    normals.AutoOrientNormalsOn()
+    normals.SplittingOff()
+    normals.ComputePointNormalsOn()
+    normals.ComputeCellNormalsOn()
+    normals.Update()
+
+    capped_with_normals = vtk.vtkPolyData()
+    capped_with_normals.DeepCopy(normals.GetOutput())
+
+    if REGENERATE_GLOBAL_IDS:
+        regenerate_global_ids(capped_with_normals)
+
+    loop_debug = append_polydata_list(
+        debug_loops,
+        clean_result=False
+    ) if debug_loops else vtk.vtkPolyData()
+
+    return capped_with_normals, assignments, loop_debug
+
+
+# ============================================================
 # REGENERATE GLOBAL NODE / ELEMENT IDS AFTER GEOMETRY CHANGES
 # ============================================================
 
@@ -4947,105 +5392,15 @@ if ENABLE_FINAL_END_BOX_SWEEP:
 
 
 # ============================================================
-# ADD FLAT CAPS
-#
-# The caps are created from the exact vtkCutter loops. Therefore their
-# boundary uses the same interpolated plane-intersection geometry as the
-# refined open surface.
+# FINAL CAPPING IS DEFERRED UNTIL AFTER ALL CLEANUP
 # ============================================================
-
-# Quality cleanup always starts from the OPEN surface.  The capped output
-# below is optional and never feeds back into the final cleaned-open model.
-quality_cleanup_input = end_box_open
-
-if WRITE_CAPPED_OUTPUT:
-
-    next_face_id = get_next_model_face_id(
-        final_open
-    )
-
-    compatible_caps = []
-
-    for local_cap_index, item in enumerate(flat_caps):
-
-        cut_index, cut, cap = item
-
-        if next_face_id is None:
-            cap_face_id = None
-        else:
-            cap_face_id = (
-                next_face_id + local_cap_index
-            )
-
-        cap_compatible = make_cap_compatible_with_surface(
-            cap,
-            final_open,
-            cap_face_id
-        )
-
-        compatible_caps.append(
-            cap_compatible
-        )
-
-    capped_inputs = [final_open] + compatible_caps
-
-    final_capped = append_polydata_list(
-        capped_inputs,
-        clean_result=True
-    )
-
-    final_capped = triangulate_polydata(
-        final_capped
-    )
-
-    # A final connectivity pass removes any cap that for some unexpected
-    # reason was not attached to the retained inlet-connected PA tree.
-    final_capped = keep_inlet_connected_region(
-        final_capped,
-        inlet_xyz
-    )
-
-    final_capped = triangulate_polydata(
-        final_capped
-    )
-
-    if REGENERATE_GLOBAL_IDS:
-        regenerate_global_ids(final_capped)
-
-    # Recompute consistent normals. Splitting is disabled so no geometry is
-    # duplicated along the new flat cap boundary.
-    normals = vtk.vtkPolyDataNormals()
-    normals.SetInputData(final_capped)
-    normals.ConsistencyOn()
-    normals.SplittingOff()
-    normals.ComputePointNormalsOn()
-    normals.ComputeCellNormalsOn()
-    normals.Update()
-
-    final_capped_with_normals = vtk.vtkPolyData()
-    final_capped_with_normals.DeepCopy(
-        normals.GetOutput()
-    )
-
-    write_polydata(
-        final_capped_with_normals,
-        OUTPUT_CAPPED_FILE
-    )
-
-    print("")
-    print("============================================")
-    print("EXACT CAPPED OUTPUT")
-    print("============================================")
-    print(
-        "Points:",
-        final_capped_with_normals.GetNumberOfPoints()
-    )
-    print(
-        "Cells:",
-        final_capped_with_normals.GetNumberOfCells()
-    )
-    print(OUTPUT_CAPPED_FILE)
-
+#
+# The older version capped the exact-cut loops here.  That is intentionally
+# disabled: the final endpoint-box sweep and mesh-quality cleanup can move an
+# opening after those loops were recorded.  The final capping pass below
+# re-detects the ACTUAL boundary loops of the finished open surface, creates
+# better-quality planar caps, stamps unique ModelFaceID values, and writes the
+# matching SimVascular .facenames file.
 
 # ============================================================
 # FINAL MESH-QUALITY / SPIKE CLEANUP
@@ -5139,6 +5494,59 @@ if ENABLE_MESH_QUALITY_CLEANUP:
     print(OUTPUT_QUALITY_CLEANED_FILE)
 
 
+
+# ============================================================
+# FINAL CAP + MODELFACEID + .FACENAMES PASS
+# ============================================================
+# Cap the ACTUAL final open model, after endpoint-box and quality cleanup.
+# This avoids using stale pre-cleanup cap loops and gives every cap a unique
+# SimVascular ModelFaceID plus a matching .facenames entry.
+
+if ENABLE_MESH_QUALITY_CLEANUP:
+    final_open_for_capping = final_quality_cleaned_with_normals
+else:
+    final_open_for_capping = end_box_open
+
+if WRITE_CAPPED_OUTPUT:
+    print("")
+    print("============================================")
+    print("FINAL CAPS + SIMVASCULAR FACE IDS")
+    print("============================================")
+
+    (
+        final_capped_with_normals,
+        final_face_assignments,
+        final_cap_loops_debug,
+    ) = build_final_capped_face_model(
+        final_open_for_capping,
+        inlet_xyz,
+        accepted_cut_by_index,
+    )
+
+    write_polydata(
+        final_capped_with_normals,
+        OUTPUT_CAPPED_FILE
+    )
+
+    write_facenames_file(
+        OUTPUT_CAPPED_FACENAMES,
+        final_face_assignments
+    )
+
+    if final_cap_loops_debug.GetNumberOfCells() > 0:
+        write_polydata(
+            final_cap_loops_debug,
+            FINAL_CAP_LOOPS_DEBUG_FILE
+        )
+
+    print("Final caps created:", len(final_face_assignments) - 1)
+    print("Wall ModelFaceID:", FINAL_CAP_WALL_FACE_ID)
+    print("Boundary edges after capping:", boundary_edge_count(final_capped_with_normals))
+    print("Capped face model:", OUTPUT_CAPPED_FILE)
+    print("Facenames file:", OUTPUT_CAPPED_FACENAMES)
+    print("Cap-loop debug:", FINAL_CAP_LOOPS_DEBUG_FILE)
+
+
 print("")
 print("============================================")
 print("CUT SUMMARY")
@@ -5155,5 +5563,8 @@ print("============================================")
 print("FINISHED")
 print("============================================")
 print("")
-print("Primary final output:", OUTPUT_QUALITY_CLEANED_FILE)
+print("Primary final OPEN output:", OUTPUT_QUALITY_CLEANED_FILE)
+if WRITE_CAPPED_OUTPUT:
+    print("Primary final CAPPED face model:", OUTPUT_CAPPED_FILE)
+    print("SimVascular facenames:", OUTPUT_CAPPED_FACENAMES)
 print("Failed-cut debug output:", FAILED_CUT_ATTEMPTS_DEBUG_FILE)
