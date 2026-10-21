@@ -3,6 +3,9 @@ import os
 import math
 from collections import defaultdict
 
+# Refinement version: exact VTK clipping + permissive retry/skip +
+# local cross-section area/shape QC for detecting mangled branch-like caps.
+
 # Refinement: every local cut can retry at nearby positions along its
 # associated centerline branch. In exploratory/permissive mode, a cut that
 # still looks geometrically bad is skipped instead of aborting the full run.
@@ -73,34 +76,79 @@ CUT_RADIUS_FACTOR = 1.35
 SIDE_BRANCH_OFFSET_FRACTION = 0.35
 
 # If a proposed cut is geometrically awkward, retry at nearby locations
-# along the SAME centerline cell before giving up. The offsets below are in
-# local vessel radii relative to the original plane position and alternate
-# in both directions. The exact interpretation depends on cut type:
+# along the SAME centerline cell before giving up. Offsets are in local
+# vessel radii relative to the original plane position.
 #
-#   side_branch: + moves farther into the removed branch, - toward junction
-#   terminal/outlet: + moves farther upstream, - back toward the endpoint
+# For terminal and true IsOutlet cuts, positive offsets move UPSTREAM toward
+# the parent vessel. Those are intentionally tried first because an ugly
+# half-branch/compound cut is usually improved by moving toward the parent.
 #
-# This is intentionally a pragmatic search rather than a new pruning rule.
-CUT_RETRY_RADIUS_OFFSETS = (
-    -0.25,
+# For side-branch pruning cuts, positive offsets move farther INTO the branch
+# being removed, which remains preferable near a bifurcation crotch.
+PARENTWARD_RETRY_RADIUS_OFFSETS = (
      0.25,
-    -0.50,
      0.50,
-    -1.00,
+     0.75,
      1.00,
      1.50,
-     2.00
+     2.00,
+    -0.25,
+    -0.50,
+    -1.00
+)
+
+SIDE_BRANCH_RETRY_RADIUS_OFFSETS = (
+     0.25,
+     0.50,
+     0.75,
+     1.00,
+     1.50,
+     2.00,
+    -0.25,
+    -0.50
 )
 
 # Never move an alternate plane beyond this fraction of the source polyline
 # cell, which helps avoid wandering into the next anatomical junction.
 CUT_RETRY_MAX_PATH_FRACTION = 0.90
 
-# Suspiciously oversized loops are retryable for side branches and true
-# IsOutlet cuts. Synthetic terminal cuts retain the older permissive warning
-# behavior because those were already working well in the earlier version.
+# Suspicious loops are retryable for ALL cut types. This now includes the
+# synthetic terminal cuts because those can also land in the middle of a
+# compound/branching region and produce the mangled openings we want to avoid.
 RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS = True
+RETRY_SUSPICIOUS_TERMINAL_LOOPS = True
 RETRY_SUSPICIOUS_OUTLET_LOOPS = True
+
+# -------------------------------------------------------------------------
+# Cross-section SHAPE / AREA quality control
+# -------------------------------------------------------------------------
+#
+# A global average cap area is not ideal for a pulmonary tree because a
+# proximal PA and a distal PA are supposed to have very different areas.
+# Instead, normalize each proposed loop by the LOCAL centerline Radius:
+#
+#       expected area = pi * Radius^2
+#
+# This catches both abnormally tiny and abnormally huge cuts without
+# penalizing legitimate vessel-size differences throughout the tree.
+ENABLE_LOOP_SHAPE_QC = True
+
+# Broad limits are intentional. We only want to reject obvious outliers.
+MIN_LOOP_AREA_TO_EXPECTED_RATIO = 0.30
+MAX_LOOP_AREA_TO_EXPECTED_RATIO = 3.50
+
+# Circularity = 4*pi*A / P^2. A circle is 1.0; a normal oval is lower but
+# should still be well above a strongly branched/lopsided contour.
+MIN_LOOP_CIRCULARITY = 0.30
+
+# Shape radii are measured from the loop's own point-centroid (not from the
+# centerline), making this sensitive to a one-sided protrusion while allowing
+# an ordinary oval. Values much above ~2 usually indicate a branch-like arm.
+MAX_LOOP_RADIAL_ASYMMETRY = 2.25
+
+# Large offset of the selected contour from the centerline is another sign
+# that the plane picked up the wrong/compound region. Expressed in local radii.
+MAX_LOOP_CENTROID_OFFSET_TO_RADIUS = 1.50
 
 # Exploratory mode requested for refinement: if all candidate locations for
 # an individual cut fail, skip ONLY that cut and continue processing the
@@ -569,7 +617,12 @@ def build_cut_retry_candidates(
     candidates = []
     used_distances = [base_distance]
 
-    for radius_offset in CUT_RETRY_RADIUS_OFFSETS:
+    if base_cut.get("type") in ("terminal", "outlet"):
+        retry_offsets = PARENTWARD_RETRY_RADIUS_OFFSETS
+    else:
+        retry_offsets = SIDE_BRANCH_RETRY_RADIUS_OFFSETS
+
+    for radius_offset in retry_offsets:
 
         target_distance = (
             base_distance
@@ -1288,6 +1341,177 @@ class SuspiciousCutLoop(RuntimeError):
     pass
 
 
+def median_value(values):
+
+    vals = sorted(float(v) for v in values)
+
+    if len(vals) == 0:
+        return None
+
+    mid = len(vals) // 2
+
+    if len(vals) % 2 == 1:
+        return vals[mid]
+
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def compute_loop_shape_metrics(loop, cut):
+
+    # Join cutter line segments into an ordered closed polyline. A clean
+    # vessel cross-section should normally collapse to one closed path.
+    loop_clean = clean_polydata(
+        loop,
+        MERGE_TOLERANCE
+    )
+
+    stripper = vtk.vtkStripper()
+    stripper.SetInputData(loop_clean)
+    stripper.JoinContiguousSegmentsOn()
+    stripper.Update()
+
+    stripped = vtk.vtkPolyData()
+    stripped.DeepCopy(stripper.GetOutput())
+
+    if stripped.GetNumberOfCells() != 1:
+        raise SuspiciousCutLoop(
+            "Selected contour did not reduce to one simple closed path "
+            "after stripping ({} paths found)."
+            .format(stripped.GetNumberOfCells())
+        )
+
+    cell = stripped.GetCell(0)
+
+    if cell is None or cell.GetNumberOfPoints() < 3:
+        raise SuspiciousCutLoop(
+            "Selected contour has too few ordered points for shape QC."
+        )
+
+    ordered = []
+
+    for i in range(cell.GetNumberOfPoints()):
+        ordered.append(
+            point_tuple(
+                stripped,
+                cell.GetPointId(i)
+            )
+        )
+
+    # vtkStripper may repeat the first point at the end of a closed loop.
+    if (
+        len(ordered) >= 2
+        and distance(ordered[0], ordered[-1])
+            <= max(MERGE_TOLERANCE * 10.0, 1e-10)
+    ):
+        ordered = ordered[:-1]
+
+    if len(ordered) < 3:
+        raise SuspiciousCutLoop(
+            "Selected contour collapsed to fewer than 3 unique points."
+        )
+
+    # Build an orthonormal basis spanning the cutting plane.
+    normal = normalize(cut["normal"])
+
+    if abs(normal[0]) < 0.9:
+        reference = (1.0, 0.0, 0.0)
+    else:
+        reference = (0.0, 1.0, 0.0)
+
+    u = normalize(cross(normal, reference))
+    v = normalize(cross(normal, u))
+
+    xy = []
+
+    for p in ordered:
+        rel = vec_sub(p, cut["center"])
+        xy.append((dot(rel, u), dot(rel, v)))
+
+    # Shoelace area and polyline perimeter.
+    twice_area = 0.0
+    perimeter = 0.0
+
+    for i in range(len(ordered)):
+        j = (i + 1) % len(ordered)
+
+        x0, y0 = xy[i]
+        x1, y1 = xy[j]
+
+        twice_area += x0 * y1 - x1 * y0
+        perimeter += distance(ordered[i], ordered[j])
+
+    area = 0.5 * abs(twice_area)
+
+    expected_area = (
+        math.pi * float(cut["radius"]) * float(cut["radius"])
+        if cut.get("radius") is not None and cut["radius"] > 0.0
+        else 0.0
+    )
+
+    if expected_area > 0.0:
+        area_ratio = area / expected_area
+    else:
+        area_ratio = float("inf")
+
+    if perimeter > PLANE_EPS and area > 0.0:
+        circularity = (
+            4.0 * math.pi * area
+            / (perimeter * perimeter)
+        )
+    else:
+        circularity = 0.0
+
+    # Assess one-sided protrusion about the loop's OWN center, not the
+    # centerline point. This prevents simple centerline offset from being
+    # mistaken for an asymmetric shape.
+    loop_centroid = (
+        sum(p[0] for p in ordered) / float(len(ordered)),
+        sum(p[1] for p in ordered) / float(len(ordered)),
+        sum(p[2] for p in ordered) / float(len(ordered))
+    )
+
+    shape_radii = []
+
+    for p in ordered:
+        rel = vec_sub(p, loop_centroid)
+        axial = dot(rel, normal)
+        radial_vec = vec_sub(
+            rel,
+            vec_scale(normal, axial)
+        )
+        shape_radii.append(magnitude(radial_vec))
+
+    median_radius = median_value(shape_radii)
+    max_shape_radius = max(shape_radii) if shape_radii else 0.0
+
+    if median_radius is not None and median_radius > PLANE_EPS:
+        radial_asymmetry = max_shape_radius / median_radius
+    else:
+        radial_asymmetry = float("inf")
+
+    centroid_offset = distance(
+        loop_centroid,
+        cut["center"]
+    )
+
+    if cut.get("radius") is not None and cut["radius"] > 0.0:
+        centroid_offset_ratio = centroid_offset / float(cut["radius"])
+    else:
+        centroid_offset_ratio = float("inf")
+
+    return {
+        "loop_area": area,
+        "expected_area": expected_area,
+        "area_ratio": area_ratio,
+        "loop_perimeter": perimeter,
+        "circularity": circularity,
+        "radial_asymmetry": radial_asymmetry,
+        "shape_centroid": loop_centroid,
+        "shape_centroid_offset": centroid_offset,
+        "shape_centroid_offset_ratio": centroid_offset_ratio
+    }
+
+
 def find_target_cut_loop(surface, cut):
 
     plane = vtk.vtkPlane()
@@ -1405,6 +1629,23 @@ def find_target_cut_loop(surface, cut):
                 "from the outlet centerline location."
             )
 
+    retry_suspicious = (
+        (
+            cut.get("type") == "side_branch"
+            and RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS
+        )
+        or
+        (
+            cut.get("type") == "terminal"
+            and RETRY_SUSPICIOUS_TERMINAL_LOOPS
+        )
+        or
+        (
+            cut.get("type") == "outlet"
+            and RETRY_SUSPICIOUS_OUTLET_LOOPS
+        )
+    )
+
     if ratio > MAX_LOOP_TO_EXPECTED_RADIUS_RATIO:
 
         message = (
@@ -1418,21 +1659,6 @@ def find_target_cut_loop(surface, cut):
             )
         )
 
-        # A side-branch loop this large is usually not the intended daughter
-        # cross-section; it is typically a compound contour through the
-        # bifurcation. Reject it so the caller can retry farther downstream.
-        retry_suspicious = (
-            (
-                cut.get("type") == "side_branch"
-                and RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS
-            )
-            or
-            (
-                cut.get("type") == "outlet"
-                and RETRY_SUSPICIOUS_OUTLET_LOOPS
-            )
-        )
-
         if retry_suspicious:
             raise SuspiciousCutLoop(message)
 
@@ -1440,6 +1666,82 @@ def find_target_cut_loop(surface, cut):
             raise RuntimeError(message)
         else:
             print("    WARNING:", message)
+
+    shape_stats = compute_loop_shape_metrics(
+        loop,
+        cut
+    )
+
+    if ENABLE_LOOP_SHAPE_QC:
+
+        shape_failures = []
+
+        if (
+            shape_stats["area_ratio"]
+            < MIN_LOOP_AREA_TO_EXPECTED_RATIO
+        ):
+            shape_failures.append(
+                "area is too small (A/(pi*r^2)={:.3f} < {:.3f})"
+                .format(
+                    shape_stats["area_ratio"],
+                    MIN_LOOP_AREA_TO_EXPECTED_RATIO
+                )
+            )
+
+        if (
+            shape_stats["area_ratio"]
+            > MAX_LOOP_AREA_TO_EXPECTED_RATIO
+        ):
+            shape_failures.append(
+                "area is too large (A/(pi*r^2)={:.3f} > {:.3f})"
+                .format(
+                    shape_stats["area_ratio"],
+                    MAX_LOOP_AREA_TO_EXPECTED_RATIO
+                )
+            )
+
+        if (
+            shape_stats["circularity"]
+            < MIN_LOOP_CIRCULARITY
+        ):
+            shape_failures.append(
+                "shape circularity is low ({:.3f} < {:.3f})"
+                .format(
+                    shape_stats["circularity"],
+                    MIN_LOOP_CIRCULARITY
+                )
+            )
+
+        if (
+            shape_stats["radial_asymmetry"]
+            > MAX_LOOP_RADIAL_ASYMMETRY
+        ):
+            shape_failures.append(
+                "one-sided radial asymmetry is high ({:.3f} > {:.3f})"
+                .format(
+                    shape_stats["radial_asymmetry"],
+                    MAX_LOOP_RADIAL_ASYMMETRY
+                )
+            )
+
+        if (
+            shape_stats["shape_centroid_offset_ratio"]
+            > MAX_LOOP_CENTROID_OFFSET_TO_RADIUS
+        ):
+            shape_failures.append(
+                "loop centroid is too far from centerline "
+                "({:.3f} local radii > {:.3f})"
+                .format(
+                    shape_stats["shape_centroid_offset_ratio"],
+                    MAX_LOOP_CENTROID_OFFSET_TO_RADIUS
+                )
+            )
+
+        if shape_failures:
+            raise SuspiciousCutLoop(
+                "Suspicious cross-section shape: "
+                + "; ".join(shape_failures)
+            )
 
     stats = {
         "num_loop_points": loop.GetNumberOfPoints(),
@@ -1449,6 +1751,8 @@ def find_target_cut_loop(surface, cut):
         "centroid": centroid,
         "centroid_offset": centroid_offset
     }
+
+    stats.update(shape_stats)
 
     return loop, plane, stats
 
@@ -2558,6 +2862,16 @@ for cut_index, cut in enumerate(pruning_cuts):
             stats["num_downstream_neighbor_cells_removed"]
         )
         print("    Loop max radial distance:", stats["max_radial"])
+        print("    Loop area:", stats.get("loop_area"))
+        print(
+            "    Area / expected local area:",
+            stats.get("area_ratio")
+        )
+        print("    Loop circularity:", stats.get("circularity"))
+        print(
+            "    Loop radial asymmetry:",
+            stats.get("radial_asymmetry")
+        )
         print(
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
@@ -2704,6 +3018,16 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             stats["num_downstream_neighbor_cells_removed"]
         )
         print("    Loop max radial distance:", stats["max_radial"])
+        print("    Loop area:", stats.get("loop_area"))
+        print(
+            "    Area / expected local area:",
+            stats.get("area_ratio")
+        )
+        print("    Loop circularity:", stats.get("circularity"))
+        print(
+            "    Loop radial asymmetry:",
+            stats.get("radial_asymmetry")
+        )
         print(
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
