@@ -3,8 +3,9 @@ import os
 import math
 from collections import defaultdict
 
-# Refinement: side-branch cuts now automatically retry farther downstream
-# when the plane intersects a suspiciously large/compound bifurcation contour.
+# Refinement: every local cut can retry at nearby positions along its
+# associated centerline branch. In exploratory/permissive mode, a cut that
+# still looks geometrically bad is skipped instead of aborting the full run.
 
 
 # ============================================================
@@ -39,6 +40,11 @@ CUT_LOOPS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Exact_Cut_Loops_Debug.vtp"
 # detached distal vessel pieces.
 SEVERED_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Exact_Severed_Debug.vtp"
 
+# Debug output: intended cutting circles for EVERY failed/rejected retry
+# position. Load this together with the centerlines/surface to see exactly
+# where the script was unhappy without stopping the rest of the run.
+FAILED_CUT_ATTEMPTS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp"
+
 
 # ============================================================
 # CENTERLINE / CUT SETTINGS
@@ -66,27 +72,42 @@ CUT_RADIUS_FACTOR = 1.35
 #        removed centerline branch
 SIDE_BRANCH_OFFSET_FRACTION = 0.35
 
-# If a side-branch plane is too close to the bifurcation, vtkCutter can
-# intersect a much larger, compound cross-section instead of just the
-# daughter vessel. In that case, automatically retry farther downstream
-# along the REMOVED centerline branch. Distances are expressed as multiples
-# of the local centerline radius. The original SIDE_BRANCH_OFFSET_FRACTION
-# cut is always tried first, so behavior is unchanged when it already works.
-SIDE_BRANCH_RETRY_RADIUS_MULTIPLIERS = (
-    0.50,
-    0.80,
-    1.10,
-    1.50,
-    2.00
+# If a proposed cut is geometrically awkward, retry at nearby locations
+# along the SAME centerline cell before giving up. The offsets below are in
+# local vessel radii relative to the original plane position and alternate
+# in both directions. The exact interpretation depends on cut type:
+#
+#   side_branch: + moves farther into the removed branch, - toward junction
+#   terminal/outlet: + moves farther upstream, - back toward the endpoint
+#
+# This is intentionally a pragmatic search rather than a new pruning rule.
+CUT_RETRY_RADIUS_OFFSETS = (
+    -0.25,
+     0.25,
+    -0.50,
+     0.50,
+    -1.00,
+     1.00,
+     1.50,
+     2.00
 )
 
-# Do not move a retry plane beyond this fraction of the removed centerline
-# cell length. This keeps the retry away from the next downstream junction.
-SIDE_BRANCH_MAX_RETRY_PATH_FRACTION = 0.75
+# Never move an alternate plane beyond this fraction of the source polyline
+# cell, which helps avoid wandering into the next anatomical junction.
+CUT_RETRY_MAX_PATH_FRACTION = 0.90
 
-# If True, a suspiciously large side-branch contour is rejected and the
-# next downstream retry location is attempted automatically.
+# Suspiciously oversized loops are retryable for side branches and true
+# IsOutlet cuts. Synthetic terminal cuts retain the older permissive warning
+# behavior because those were already working well in the earlier version.
 RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS = True
+RETRY_SUSPICIOUS_OUTLET_LOOPS = True
+
+# Exploratory mode requested for refinement: if all candidate locations for
+# an individual cut fail, skip ONLY that cut and continue processing the
+# remaining tree. The skipped/failed attempt circles are written to a debug
+# VTP so they can be inspected afterward.
+SKIP_FAILED_PRUNING_CUTS = True
+SKIP_FAILED_OUTLET_CUTS = True
 
 # If the retained centerline terminates at a pruning junction, make one
 # transverse cut using the last retained branch direction. Positive values
@@ -502,54 +523,66 @@ def sample_centerline_cell_at_distance(
     return None
 
 
-def build_side_branch_retry_candidates(
-    full_centerline,
-    removed_entry,
+def build_cut_retry_candidates(
+    centerline,
+    endpoint_entry,
     base_cut,
-    radius_array
+    radius_array,
+    flip_sample_normal=False
 ):
 
     point_ids = ordered_cell_point_ids_from_endpoint(
-        full_centerline,
-        removed_entry
+        centerline,
+        endpoint_entry
     )
 
     total_length = polyline_total_length(
-        full_centerline,
+        centerline,
         point_ids
     )
 
     if total_length <= PLANE_EPS:
         return []
 
-    max_retry_distance = (
-        total_length
-        * SIDE_BRANCH_MAX_RETRY_PATH_FRACTION
+    endpoint = point_tuple(
+        centerline,
+        endpoint_entry["point_id"]
     )
 
-    # The original cut may be extremely close to the junction because it is
-    # based only on the first centerline edge. Do not generate retry points
-    # that are effectively the same location.
-    original_distance = distance(
+    # Every base cut used here lies on the first centerline edge measured
+    # from this endpoint, so Euclidean distance is also its path distance.
+    base_distance = distance(
         base_cut["center"],
-        base_cut["junction"]
+        endpoint
     )
+
+    max_distance = (
+        total_length
+        * CUT_RETRY_MAX_PATH_FRACTION
+    )
+
+    base_radius = float(base_cut["radius"])
+
+    if not math.isfinite(base_radius) or base_radius <= 0.0:
+        return []
 
     candidates = []
-    used_distances = []
+    used_distances = [base_distance]
 
-    for multiplier in SIDE_BRANCH_RETRY_RADIUS_MULTIPLIERS:
+    for radius_offset in CUT_RETRY_RADIUS_OFFSETS:
 
         target_distance = (
-            float(multiplier)
-            * float(base_cut["radius"])
+            base_distance
+            + float(radius_offset) * base_radius
         )
 
-        if target_distance > max_retry_distance:
-            target_distance = max_retry_distance
+        # Stay on this branch cell. Zero is allowed because it corresponds
+        # exactly to the anatomical endpoint/junction.
+        if target_distance < 0.0:
+            target_distance = 0.0
 
-        if target_distance <= original_distance + PLANE_EPS:
-            continue
+        if target_distance > max_distance:
+            target_distance = max_distance
 
         if any(
             abs(target_distance - d) <= PLANE_EPS
@@ -558,8 +591,8 @@ def build_side_branch_retry_candidates(
             continue
 
         sample = sample_centerline_cell_at_distance(
-            full_centerline,
-            removed_entry,
+            centerline,
+            endpoint_entry,
             target_distance,
             radius_array
         )
@@ -576,23 +609,46 @@ def build_side_branch_retry_candidates(
 
         candidate = dict(base_cut)
         candidate["center"] = sample["center"]
-        candidate["normal"] = sample["normal"]
+
+        sampled_normal = sample["normal"]
+
+        if flip_sample_normal:
+            sampled_normal = vec_scale(
+                sampled_normal,
+                -1.0
+            )
+
+        candidate["normal"] = sampled_normal
         candidate["radius"] = sample["radius"]
         candidate["cut_radius"] = (
             sample["radius"]
             * CUT_RADIUS_FACTOR
         )
-        candidate["retry_distance_from_junction"] = (
-            sample["distance_from_junction"]
-        )
+        candidate["retry_distance_from_anchor"] = target_distance
+        candidate["retry_radius_offset"] = float(radius_offset)
 
         candidates.append(candidate)
         used_distances.append(target_distance)
 
-        if target_distance >= max_retry_distance - PLANE_EPS:
-            break
-
     return candidates
+
+
+def build_side_branch_retry_candidates(
+    full_centerline,
+    removed_entry,
+    base_cut,
+    radius_array
+):
+
+    # The endpoint is the pruning junction and the ordered cell direction
+    # points INTO the removed branch, which is also the desired plane normal.
+    return build_cut_retry_candidates(
+        full_centerline,
+        removed_entry,
+        base_cut,
+        radius_array,
+        flip_sample_normal=False
+    )
 
 
 # ============================================================
@@ -791,21 +847,35 @@ def build_cut_definitions(full_centerline, retained_cell_ids):
 
             radius = max(valid_radii)
 
-            cuts.append(
-                {
-                    "type": "terminal",
-                    "center": cut_center,
-                    "junction": junction,
-                    "normal": normal,
-                    "radius": radius,
-                    "cut_radius": radius * CUT_RADIUS_FACTOR,
-                    "source_cell_id": kept["cell_id"],
-                    "removed_cell_ids": [
-                        e["cell_id"]
-                        for e in removed_entries
-                    ]
-                }
+            base_cut = {
+                "type": "terminal",
+                "center": cut_center,
+                "junction": junction,
+                "normal": normal,
+                "radius": radius,
+                "cut_radius": radius * CUT_RADIUS_FACTOR,
+                "source_cell_id": kept["cell_id"],
+                "source_endpoint_local_id": kept["endpoint_local_id"],
+                "removed_cell_ids": [
+                    e["cell_id"]
+                    for e in removed_entries
+                ]
+            }
+
+            # If this terminal plane happens to overlap a previous cut or
+            # otherwise fails geometrically, try nearby positions on the
+            # retained parent cell. sample_centerline_cell_at_distance()
+            # points from the terminal junction upstream, so flip its normal
+            # to preserve the desired outward/downstream cut orientation.
+            base_cut["retry_candidates"] = build_cut_retry_candidates(
+                full_centerline,
+                kept,
+                base_cut,
+                radius_array,
+                flip_sample_normal=True
             )
+
+            cuts.append(base_cut)
 
         # ----------------------------------------------------
         # CASE 2: retained tree continues; remove side branch.
@@ -875,6 +945,7 @@ def build_cut_definitions(full_centerline, retained_cell_ids):
                     "radius": radius,
                     "cut_radius": radius * CUT_RADIUS_FACTOR,
                     "source_cell_id": removed["cell_id"],
+                    "source_endpoint_local_id": removed["endpoint_local_id"],
                     "removed_cell_ids": [
                         removed["cell_id"]
                     ]
@@ -957,11 +1028,11 @@ def build_outlet_cut_definitions(trimmed_centerline):
 
             if outlet_id == first_id:
                 interior_id = int(cell.GetPointId(1))
-                endpoint_candidates.append((cell_id, interior_id))
+                endpoint_candidates.append((cell_id, interior_id, 0))
 
             elif outlet_id == last_id:
                 interior_id = int(cell.GetPointId(n - 2))
-                endpoint_candidates.append((cell_id, interior_id))
+                endpoint_candidates.append((cell_id, interior_id, -1))
 
         if len(endpoint_candidates) == 0:
             print(
@@ -980,7 +1051,7 @@ def build_outlet_cut_definitions(trimmed_centerline):
                 )
             )
 
-        source_cell_id, interior_id = endpoint_candidates[0]
+        source_cell_id, interior_id, source_endpoint_local_id = endpoint_candidates[0]
 
         outlet = point_tuple(
             trimmed_centerline,
@@ -1033,19 +1104,38 @@ def build_outlet_cut_definitions(trimmed_centerline):
         # conservative, especially where Radius collapses near an old cap.
         radius = max(valid_radii)
 
-        cuts.append(
-            {
-                "type": "outlet",
-                "center": cut_center,
-                "junction": outlet,
-                "normal": normal,
-                "radius": radius,
-                "cut_radius": radius * CUT_RADIUS_FACTOR,
-                "source_cell_id": source_cell_id,
-                "source_point_id": outlet_id,
-                "removed_cell_ids": []
-            }
+        base_cut = {
+            "type": "outlet",
+            "center": cut_center,
+            "junction": outlet,
+            "normal": normal,
+            "radius": radius,
+            "cut_radius": radius * CUT_RADIUS_FACTOR,
+            "source_cell_id": source_cell_id,
+            "source_endpoint_local_id": source_endpoint_local_id,
+            "source_point_id": outlet_id,
+            "removed_cell_ids": []
+        }
+
+        endpoint_entry = {
+            "cell_id": source_cell_id,
+            "endpoint_local_id": source_endpoint_local_id,
+            "point_id": outlet_id
+        }
+
+        # Alternate positions move both closer to the true endpoint and
+        # farther upstream along the same final centerline cell. The sampled
+        # cell direction points upstream, so flip it to keep the cut normal
+        # outward/downstream.
+        base_cut["retry_candidates"] = build_cut_retry_candidates(
+            trimmed_centerline,
+            endpoint_entry,
+            base_cut,
+            radius_array,
+            flip_sample_normal=True
         )
+
+        cuts.append(base_cut)
 
     return cuts, skipped_topology
 
@@ -1129,6 +1219,12 @@ def write_cut_debug_file(cuts, filename):
     cut_radius = vtk.vtkDoubleArray()
     cut_radius.SetName("ExpectedCutRadius")
 
+    attempt_number = vtk.vtkIntArray()
+    attempt_number.SetName("AttemptNumber")
+
+    planned_cut_index = vtk.vtkIntArray()
+    planned_cut_index.SetName("PlannedCutIndex")
+
     for cut in cuts:
 
         add_debug_circle(
@@ -1155,6 +1251,14 @@ def write_cut_debug_file(cuts, filename):
             float(cut["cut_radius"])
         )
 
+        attempt_number.InsertNextValue(
+            int(cut.get("attempt_number", 1))
+        )
+
+        planned_cut_index.InsertNextValue(
+            int(cut.get("planned_cut_index", -1))
+        )
+
     debug = vtk.vtkPolyData()
     debug.SetPoints(points)
     debug.SetLines(lines)
@@ -1162,6 +1266,8 @@ def write_cut_debug_file(cuts, filename):
     debug.GetCellData().AddArray(cut_type)
     debug.GetCellData().AddArray(source_cell)
     debug.GetCellData().AddArray(cut_radius)
+    debug.GetCellData().AddArray(attempt_number)
+    debug.GetCellData().AddArray(planned_cut_index)
 
     write_polydata(debug, filename)
 
@@ -1315,10 +1421,19 @@ def find_target_cut_loop(surface, cut):
         # A side-branch loop this large is usually not the intended daughter
         # cross-section; it is typically a compound contour through the
         # bifurcation. Reject it so the caller can retry farther downstream.
-        if (
-            cut.get("type") == "side_branch"
-            and RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS
-        ):
+        retry_suspicious = (
+            (
+                cut.get("type") == "side_branch"
+                and RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS
+            )
+            or
+            (
+                cut.get("type") == "outlet"
+                and RETRY_SUSPICIOUS_OUTLET_LOOPS
+            )
+        )
+
+        if retry_suspicious:
             raise SuspiciousCutLoop(message)
 
         if FAIL_ON_SUSPICIOUS_LOOP:
@@ -1825,51 +1940,62 @@ def apply_exact_local_plane_cut(surface, cut):
     return result, loop, cap, stats
 
 
-def apply_pruning_cut_with_retries(surface, cut):
+class CutRetriesExhausted(RuntimeError):
 
-    # Non-side-branch pruning cuts retain the existing single-attempt
-    # behavior. The adaptive retry is intentionally targeted only at the
-    # side-branch/bifurcation failure mode.
-    if cut.get("type") != "side_branch":
+    def __init__(self, cut, attempts, failure_messages):
 
-        result, loop, cap, stats = (
-            apply_exact_local_plane_cut(
-                surface,
-                cut
+        self.cut = cut
+        self.attempts = attempts
+        self.failure_messages = failure_messages
+
+        super().__init__(
+            "All {} candidate plane locations failed.\n{}"
+            .format(
+                len(attempts),
+                "\n".join(failure_messages)
             )
         )
 
-        stats["retry_attempt"] = 0
-        stats["retry_distance_from_junction"] = distance(
-            cut["center"],
-            cut["junction"]
-        )
 
-        return result, loop, cap, stats, cut
+def apply_cut_with_retries(surface, cut):
 
-    attempts = [cut]
+    # Always try the originally planned plane first. Only if that attempt
+    # fails do we walk to nearby positions on the same centerline cell.
+    attempts = [dict(cut)]
     attempts.extend(
-        cut.get("retry_candidates", [])
+        dict(candidate)
+        for candidate in cut.get("retry_candidates", [])
     )
 
     failure_messages = []
+    failed_attempts = []
 
     for attempt_index, candidate in enumerate(attempts):
 
+        candidate["attempt_number"] = attempt_index + 1
+        candidate["planned_cut_index"] = cut.get(
+            "planned_cut_index",
+            -1
+        )
+
         if attempt_index > 0:
+
+            offset = candidate.get("retry_radius_offset", None)
+
+            if offset is None:
+                offset_text = "alternate centerline position"
+            elif offset > 0.0:
+                offset_text = "+{:.2f} local radii along cell".format(offset)
+            else:
+                offset_text = "{:.2f} local radii along cell".format(offset)
+
             print(
-                "    Retrying side-branch cut farther downstream "
-                "(attempt {}/{}, distance {:.6g} from junction)."
+                "    Retrying {} cut (attempt {}/{}) at {}."
                 .format(
+                    candidate.get("type", "local"),
                     attempt_index + 1,
                     len(attempts),
-                    candidate.get(
-                        "retry_distance_from_junction",
-                        distance(
-                            candidate["center"],
-                            candidate["junction"]
-                        )
-                    )
+                    offset_text
                 )
             )
 
@@ -1883,67 +2009,43 @@ def apply_pruning_cut_with_retries(surface, cut):
             )
 
             stats["retry_attempt"] = attempt_index
-            stats["retry_distance_from_junction"] = distance(
+            stats["retry_distance_from_anchor"] = distance(
                 candidate["center"],
                 candidate["junction"]
             )
 
             return result, loop, cap, stats, candidate
 
-        except (
-            SuspiciousCutLoop,
-            NoCutLoopFound
-        ) as exc:
+        except Exception as exc:
+
+            # In this refinement/debugging version, geometric failures are
+            # deliberately treated as retryable. This includes: no local
+            # contour, oversized/compound contour, source-cell mapping
+            # failure, empty proximal fragments, and cap triangulation.
+            # The original input surface is not modified unless the function
+            # returns successfully, so rejecting an attempt is safe.
+            message = str(exc)
+
+            failed_attempts.append(candidate)
 
             failure_messages.append(
                 "attempt {}: {}".format(
                     attempt_index + 1,
-                    exc
+                    message
                 )
             )
 
             print(
                 "    Rejected this plane:",
-                exc
+                message
             )
 
             continue
 
-        except RuntimeError as exc:
-
-            # vtkContourTriangulator failures are also commonly caused by a
-            # compound/non-simple intersection near a bifurcation. Retry
-            # those farther downstream as well. Other runtime failures remain
-            # fatal so coding/data errors are not silently hidden.
-            message = str(exc)
-
-            if (
-                "vtkContourTriangulator could not create a cap"
-                in message
-            ):
-
-                failure_messages.append(
-                    "attempt {}: {}".format(
-                        attempt_index + 1,
-                        message
-                    )
-                )
-
-                print(
-                    "    Rejected this plane because the contour "
-                    "could not be triangulated as a simple cap."
-                )
-
-                continue
-
-            raise
-
-    raise RuntimeError(
-        "All {} side-branch plane locations failed.\n{}"
-        .format(
-            len(attempts),
-            "\n".join(failure_messages)
-        )
+    raise CutRetriesExhausted(
+        cut,
+        failed_attempts,
+        failure_messages
     )
 
 
@@ -2397,7 +2499,9 @@ print("Triangulated surface cells:", working_surface.GetNumberOfCells())
 selected_loops = []
 flat_caps = []
 successful_cut_indices = []
+skipped_pruning_cut_indices = []
 skipped_outlet_cut_indices = []
+failed_cut_attempts = []
 
 print("")
 print("============================================")
@@ -2405,6 +2509,8 @@ print("STAGE 1: Applying pruning-boundary VTK cuts")
 print("============================================")
 
 for cut_index, cut in enumerate(pruning_cuts):
+
+    cut["planned_cut_index"] = cut_index
 
     print("")
     print(
@@ -2424,7 +2530,7 @@ for cut_index, cut in enumerate(pruning_cuts):
             cap,
             stats,
             used_cut
-        ) = apply_pruning_cut_with_retries(
+        ) = apply_cut_with_retries(
             working_surface,
             cut
         )
@@ -2462,24 +2568,45 @@ for cut_index, cut in enumerate(pruning_cuts):
                 stats["retry_attempt"] + 1
             )
             print(
-                "    Accepted distance from junction:",
-                stats["retry_distance_from_junction"]
+                "    Accepted distance from anchor endpoint:",
+                stats["retry_distance_from_anchor"]
             )
         print(
             "    Working surface cells after cut:",
             working_surface.GetNumberOfCells()
         )
 
+    except CutRetriesExhausted as exc:
+
+        skipped_pruning_cut_indices.append(cut_index)
+        failed_cut_attempts.extend(exc.attempts)
+
+        print(
+            "    SKIPPED ENTIRELY after {} failed plane location(s)."
+            .format(len(exc.attempts))
+        )
+        print(
+            "    The surface is left unchanged for this cut so the "
+            "problem can be inspected afterward."
+        )
+
+        if not SKIP_FAILED_PRUNING_CUTS:
+            raise
+
     except Exception as exc:
 
-        raise RuntimeError(
-            "Pruning cut {} ({}) failed:\n{}"
-            .format(
-                cut_index,
-                cut["type"],
-                exc
-            )
-        )
+        # Extra permissive safety net for this refinement phase. Missing
+        # input arrays/top-level setup errors still fail before this loop,
+        # but a single problematic anatomical cut does not kill the batch.
+        failed_cut = dict(cut)
+        failed_cut["attempt_number"] = 1
+        failed_cut_attempts.append(failed_cut)
+        skipped_pruning_cut_indices.append(cut_index)
+
+        print("    SKIPPED ENTIRELY because of unexpected cut error:", exc)
+
+        if not SKIP_FAILED_PRUNING_CUTS:
+            raise
 
 
 # ============================================================
@@ -2527,6 +2654,8 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
         + outlet_local_index
     )
 
+    cut["planned_cut_index"] = cut_index
+
     print("")
     print(
         "IsOutlet cut {}/{} (point {})"
@@ -2543,8 +2672,9 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             working_surface,
             loop,
             cap,
-            stats
-        ) = apply_exact_local_plane_cut(
+            stats,
+            used_cut
+        ) = apply_cut_with_retries(
             working_surface,
             cut
         )
@@ -2553,12 +2683,12 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             annotate_loop(
                 loop,
                 cut_index,
-                cut
+                used_cut
             )
         )
 
         flat_caps.append(
-            (cut_index, cut, cap)
+            (cut_index, used_cut, cap)
         )
 
         successful_cut_indices.append(
@@ -2578,10 +2708,38 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
         )
+        if stats.get("retry_attempt", 0) > 0:
+            print(
+                "    Accepted retry attempt:",
+                stats["retry_attempt"] + 1
+            )
+            print(
+                "    Accepted distance from outlet endpoint:",
+                stats["retry_distance_from_anchor"]
+            )
         print(
             "    Working surface cells after cut:",
             working_surface.GetNumberOfCells()
         )
+
+    except CutRetriesExhausted as exc:
+
+        outlet_skip_count += 1
+        skipped_outlet_cut_indices.append(cut_index)
+        failed_cut_attempts.extend(exc.attempts)
+
+        print(
+            "    SKIPPED ENTIRELY after {} failed plane location(s)."
+            .format(len(exc.attempts))
+        )
+        print(
+            "    This commonly means the branch was already hit by an "
+            "earlier pruning cut, or no clean local cross-section exists "
+            "at the tested positions."
+        )
+
+        if not SKIP_FAILED_OUTLET_CUTS:
+            raise
 
     except NoCutLoopFound as exc:
 
@@ -2599,20 +2757,56 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
 
     except Exception as exc:
 
-        # A genuinely geometric/VTK failure is still treated as an error.
-        # Only absence of a local cross-section is silently skippable.
-        raise RuntimeError(
-            "IsOutlet cut {} (point {}) failed:\n{}"
-            .format(
-                outlet_local_index,
-                cut["source_point_id"],
-                exc
-            )
+        outlet_skip_count += 1
+        skipped_outlet_cut_indices.append(cut_index)
+
+        failed_cut = dict(cut)
+        failed_cut["attempt_number"] = 1
+        failed_cut_attempts.append(failed_cut)
+
+        print(
+            "    SKIPPED ENTIRELY because of unexpected cut error:",
+            exc
         )
 
+        if not SKIP_FAILED_OUTLET_CUTS:
+            raise
+
 print("")
+print("Pruning cuts skipped:", len(skipped_pruning_cut_indices))
 print("IsOutlet cuts completed:", outlet_success_count)
-print("IsOutlet cuts skipped (no local cross-section):", outlet_skip_count)
+print("IsOutlet cuts skipped:", outlet_skip_count)
+
+if len(skipped_pruning_cut_indices) > 0:
+    print("Skipped pruning cut indices:", skipped_pruning_cut_indices)
+
+if len(skipped_outlet_cut_indices) > 0:
+    print("Skipped IsOutlet cut indices:", skipped_outlet_cut_indices)
+
+
+# ============================================================
+# WRITE FAILED/REJECTED CUT-ATTEMPT DEBUG FILE
+# ============================================================
+
+if len(failed_cut_attempts) > 0:
+
+    write_cut_debug_file(
+        failed_cut_attempts,
+        FAILED_CUT_ATTEMPTS_DEBUG_FILE
+    )
+
+    print("")
+    print("Failed/rejected cut-attempt debug file:")
+    print(FAILED_CUT_ATTEMPTS_DEBUG_FILE)
+    print(
+        "Color by CutType, AttemptNumber, or PlannedCutIndex to "
+        "inspect exactly where skipped cuts were attempted."
+    )
+
+else:
+
+    print("")
+    print("No failed cut attempts were recorded.")
 
 
 # ============================================================
