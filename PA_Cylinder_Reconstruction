@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+"""
+PA_cylindrical_reconstruction.py
+================================
+Reconstruct a connected, capped 3-D pulmonary artery (PA) surface from a
+*trimmed* VTK centerline (.vtp), without using an existing 3-D vessel surface.
+
+DESIGN
+------
+  (1) Interpret connected 1-D centerline edges as a rooted graph (IsInlet).
+      Collapse repeated edges but do NOT invent edges between nearby branches.
+  (2) Split the tree at bifurcations and ends. Each directed graph branch is
+      independently lofted through circles oriented perpendicular to its local
+      tangent; at a junction, each outgoing branch gets its own oriented ring.
+  (3) Treat each successive ring pair as a closed tapered tube and combine
+      their NEGATIVE-INSIDE implicit fields by pointwise minimum (union). This
+      produces a true geometric UNION,
+      unlike Delaunay3D on all appended rings, which can bridge empty space.
+  (4) Extract a single union surface with FlyingEdges, attach provisional
+      ModelFaceID + SimVascular .facenames, and save extensive diagnostics.
+
+IMPORTANT:
+- This is an INITIAL reconstruction approach. The implicit union is voxelized:
+  terminal caps are nearly planar, not mathematically exact planes. Review
+  cap-to-wall labels and topology before Gmsh / SimVascular meshing.
+- Radius values (including clamped values) are in the units of the source VTP.
+- Delaunay3D is intentionally NOT used globally. The ring loft is a QUAD-strip
+  surface triangulation; disconnected tubes only meet during the implicit union.
+- A *trimmed* centerline is required. The script does not choose which anatomical
+  branches should be discarded, and does not perform clot subtraction.
+
+Run:
+  python PA_cylindrical_reconstruction.py
+  python PA_cylindrical_reconstruction.py --input /path/to/trimmed.vtp \
+      --output-dir /path/to/PA_cylindrical_output --spacing 0.7
+
+Requirements: numpy, scipy, vtk. Python 3.9+ (including 3.12).
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import heapq
+import json
+import math
+import os
+from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+
+import numpy as np
+from scipy import ndimage
+import vtk
+from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
+
+# ======================== USER CONFIGURATION ================================
+CENTERLINE_VTP = r"JL_Centerline_Trimmed.vtp"  # <--- CHANGE TO YOUR TRIMMED VTP
+OUTPUT_DIR = r"PA_cylindrical_reconstruction"
+
+RADIUS_ARRAY_CANDIDATES = ("Radius", "MaximumInscribedSphereRadius")
+INLET_ARRAY = "IsInlet"
+OUTLET_ARRAY = "IsOutlet"
+SIDEDNESS_ARRAY = "Sidedness"  # vtkStringArray: Left, Right, other/null
+
+CIRCLE_RESOLUTION = 40
+MAX_RING_STEP = 2.0               # longest axial spacing between neighboring rings
+RING_STEP_RADIUS_FACTOR = 0.85   # also restrict ring step relative to radius
+MIN_CENTERLINE_STEP = 1.0e-7
+RADIUS_FLOOR_ABSOLUTE = 0.35     # use 0 to disable; identical units to VTP
+RADIUS_FLOOR_MEDIAN_FACTOR = 0.0 # optionally e.g. 0.1, applied in addition
+
+# An implicit UNION makes branch intersections well-defined and avoids the
+# need to choose a triangulation spanning an entire group of circles.
+VOXEL_SPACING = 0.65
+MAX_GRID_VOXELS = 50_000_000      # safety cap, auto-coarsen if too large
+AUTO_COARSEN_GRID = True
+SURFACE_BLUR_SIGMA_VOXELS = 0.45  # 0 = no smoothing of signed distance field
+GRID_PADDING_RADII = 1.5
+GRID_PADDING_VOXELS = 5
+
+# Label exposed terminal cap triangles by distance to their original ring
+# plane AND agreement between outward terminal normal and surface normal.
+CAP_PLANE_TOL_VOXELS = 1.9
+CAP_PLANE_TOL_RADIUS_FACTOR = 0.12
+CAP_MAX_RADIAL_FACTOR = 1.25
+CAP_NORMAL_ALIGNMENT_MIN = 0.52
+
+# Diagnostic output; unmerged tubes are NOT suitable as a CFD boundary.
+WRITE_UNMERGED_TUBES = True
+WRITE_RING_DEBUG = True
+WRITE_UNION_DISTANCE_FIELD_VTI = False  # potentially enormous
+EXTRACT_SINGLE_REGION_ONLY = False     # manual override: keep largest even if not tiny
+AUTO_REMOVE_TINY_UNION_ISLANDS = True  # prune only extremely small voxel islands
+TINY_ISLAND_MAX_FRACTION_OF_MAIN = 0.004
+TINY_ISLAND_MAX_TOTAL_FRACTION = 0.02
+
+# If centerline has cycles (common in noisy/overlapping networks), the rooted
+# shortest-path spanning tree is used. All discarded graph links are reported.
+ALLOW_CYCLES_WITH_SPANNING_TREE = True
+# ============================================================================
+
+
+def _write_vtp(mesh: vtk.vtkPolyData, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(path))
+    writer.SetInputData(mesh)
+    writer.SetDataModeToBinary()
+    writer.SetCompressorTypeToZLib()
+    if not writer.Write():
+        raise IOError(f"Could not write VTP: {path}")
+
+
+def _write_vti(im: vtk.vtkImageData, path: Path):
+    writer = vtk.vtkXMLImageDataWriter()
+    writer.SetFileName(str(path))
+    writer.SetInputData(im)
+    writer.SetDataModeToBinary()
+    if not writer.Write():
+        raise IOError(f"Could not write VTI: {path}")
+
+
+def _write_csv(path: Path, rows, fieldnames):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', newline='', encoding='utf-8') as f:
+        out = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        out.writeheader()
+        out.writerows(rows)
+
+
+def _norm(x):
+    return float(np.linalg.norm(x))
+
+
+def _unit(x, backup=None):
+    length = _norm(x)
+    if length <= 1e-13:
+        if backup is not None:
+            return _unit(backup)
+        raise ValueError('Cannot normalize zero direction vector')
+    return np.asarray(x, dtype=np.float64) / length
+
+
+def _vtk_string_arr(poly: vtk.vtkPolyData, name: str):
+    arr = poly.GetPointData().GetAbstractArray(name)
+    if arr is None:
+        return None
+    return [str(arr.GetVariantValue(i).ToString()) for i in range(poly.GetNumberOfPoints())]
+
+
+def _choose_array(poly, names, required=False):
+    for name in names:
+        arr = poly.GetPointData().GetArray(name)
+        if arr is not None:
+            return np.asarray(vtk_to_numpy(arr)), name
+    if required:
+        raise RuntimeError('Missing point-data array: ' + ' / '.join(names))
+    return None, None
+
+
+@dataclass
+class Graph:
+    xyz: np.ndarray
+    radius: np.ndarray
+    sidedness: list
+    is_inlet: np.ndarray
+    is_outlet: np.ndarray
+    adj: list
+    root: int
+    parent: np.ndarray
+    children: list
+    distances: np.ndarray
+    tree_nodes: set
+    branches: list
+    tips: list
+    stats: dict
+
+
+def _make_graph(poly: vtk.vtkPolyData) -> Graph:
+    n_input = poly.GetNumberOfPoints()
+    if n_input < 2:
+        raise RuntimeError('Centerline has fewer than 2 points')
+    orig_xyz = vtk_to_numpy(poly.GetPoints().GetData()).astype(np.float64)
+    raw_r, radius_name = _choose_array(poly, RADIUS_ARRAY_CANDIDATES, required=True)
+    raw_r = np.asarray(raw_r, dtype=np.float64).reshape(-1)
+    raw_inlet, _ = _choose_array(poly, [INLET_ARRAY]); raw_outlet, _ = _choose_array(poly, [OUTLET_ARRAY])
+    raw_sides = _vtk_string_arr(poly, SIDEDNESS_ARRAY)
+    if raw_sides is None:
+        raw_sides = ['null'] * n_input
+    raw_inlet = np.zeros(n_input) if raw_inlet is None else np.asarray(raw_inlet).reshape(-1)
+    raw_outlet = np.zeros(n_input) if raw_outlet is None else np.asarray(raw_outlet).reshape(-1)
+
+    # Merge only EXACTLY coincident 3D points, not geometrically neighboring
+    # branches. This also merges branch origins stored with separate point IDs.
+    xyz, reverse = np.unique(orig_xyz, axis=0, return_inverse=True)
+    n = len(xyz)
+    valid_r = np.where(np.isfinite(raw_r) & (raw_r > 0), raw_r, 0.0)
+    summed = np.bincount(reverse, weights=valid_r, minlength=n)
+    counts = np.bincount(reverse, weights=(valid_r > 0).astype(float), minlength=n)
+    radius = summed / np.maximum(counts, 1)
+    inlet = np.bincount(reverse, weights=(raw_inlet > 0.5).astype(float), minlength=n) > 0
+    outlet = np.bincount(reverse, weights=(raw_outlet > 0.5).astype(float), minlength=n) > 0
+    sides = ['null'] * n
+    for pid, val in enumerate(raw_sides):
+        normalized = val.strip().lower()
+        if normalized in ('left', 'right'):
+            sides[int(reverse[pid])] = normalized.title()
+
+    positive = radius[radius > 0]
+    if len(positive) == 0:
+        raise RuntimeError(f'Radius array {radius_name} contains no positive values')
+    r_med = float(np.median(positive))
+    r_min = max(RADIUS_FLOOR_ABSOLUTE, RADIUS_FLOOR_MEDIAN_FACTOR * r_med)
+    missing_radius = radius <= 0
+    radius = np.maximum(radius, r_min)
+
+    # Build unique undirected edges from the original VTK polyline cells.
+    edges = set()
+    for ci in range(poly.GetNumberOfCells()):
+        cell = poly.GetCell(ci)
+        count = cell.GetNumberOfPoints()
+        if count < 2:
+            continue
+        ids = [int(reverse[cell.GetPointId(j)]) for j in range(count)]
+        for a, b in zip(ids[:-1], ids[1:]):
+            if a != b and _norm(xyz[a] - xyz[b]) > MIN_CENTERLINE_STEP:
+                edges.add((min(a, b), max(a, b)))
+    adj = [set() for _ in range(n)]
+    for a, b in sorted(edges):
+        adj[a].add(b); adj[b].add(a)
+
+    inlets = [i for i in np.flatnonzero(inlet) if len(adj[i]) > 0]
+    degree1 = [i for i in range(n) if len(adj[i]) == 1]
+    if inlets:
+        # Prefer the marked inlet that is at the end of an open trunk.
+        root = sorted(inlets, key=lambda i: (len(adj[i]) != 1, -radius[i]))[0]
+    elif degree1:
+        root = max(degree1, key=lambda i: radius[i])
+        print(f'WARNING: no IsInlet mark. Using largest-radius terminal point {root}.')
+    else:
+        raise RuntimeError('Could not determine inlet: no IsInlet and no degree-1 nodes')
+
+    # Weighted Dijkstra produces a rooted tree and removes only graph cycles,
+    # never creates new connections between separate physical centerlines.
+    parent = np.full(n, -1, dtype=np.int64)
+    dist = np.full(n, np.inf, dtype=np.float64)
+    dist[root] = 0.0
+    heap = [(0.0, root)]
+    seen = set()
+    while heap:
+        d, a = heapq.heappop(heap)
+        if d > dist[a] + 1e-10 or a in seen:
+            continue
+        seen.add(a)
+        for b in sorted(adj[a]):
+            weight = _norm(xyz[b] - xyz[a])
+            nd = d + weight
+            if nd + 1e-10 < dist[b]:
+                dist[b] = nd
+                parent[b] = a
+                heapq.heappush(heap, (nd, b))
+
+    # The inlet point of VMTK centerlines can have Radius == 0 despite
+    # neighboring trunk points having a valid inscribed-sphere radius.
+    # Impute ONLY truly missing (zero/NaN) radii from graph neighbors.
+    imputed = 0
+    for i in sorted(seen):
+        if missing_radius[i] and adj[i]:
+            neighbors=[float(radius[j]) for j in adj[i] if not missing_radius[j]]
+            if neighbors:
+                radius[i]=max(float(np.median(neighbors)),r_min)
+                imputed+=1
+    components_discarded = int(np.count_nonzero(~np.isfinite(dist)))
+    if len(seen) < 2:
+        raise RuntimeError('Inlet-connected tree contains fewer than 2 points')
+    children = [[] for _ in range(n)]
+    for i in seen:
+        if i != root:
+            children[int(parent[i])].append(i)
+    for ch in children:
+        ch.sort()
+    num_cycle_edges = len([1 for a,b in edges if a in seen and b in seen]) - (len(seen)-1)
+    if num_cycle_edges and not ALLOW_CYCLES_WITH_SPANNING_TREE:
+        raise RuntimeError(f'Centerline topology has {num_cycle_edges} cycle edges')
+
+    # Junctions are split along each downstream direction: distinct per-branch
+    # oriented rings are constructed even when multiple paths share point ID.
+    starts = [i for i in seen if i == root or len(children[i]) != 1]
+    branches = []
+    for start in sorted(starts, key=lambda i: dist[i]):
+        for ch in children[start]:
+            chain = [start, ch]
+            node = ch
+            while len(children[node]) == 1:
+                node = children[node][0]
+                chain.append(node)
+            branches.append(chain)
+
+    tips = [i for i in seen if not children[i] and i != root]
+    tagged_tips = [i for i in tips if outlet[i]]
+    unmarked_tips = [i for i in tips if not outlet[i]]
+    flags_internal = [i for i in seen if outlet[i] and i not in tips]
+    stats = {
+        'source_points': n_input, 'merged_points': n,
+        'duplicate_points_merged': n_input - n,
+        'unique_graph_edges': len(edges), 'root_id': int(root),
+        'connected_points': len(seen), 'disconnected_points_ignored': components_discarded,
+        'spanning_tree_cycle_edges_removed': int(num_cycle_edges),
+        'tree_branches': len(branches),
+        'branch_junctions': sum(len(children[i]) >= 2 for i in seen),
+        'terminal_endpoints': len(tips), 'marked_outlets': len(tagged_tips),
+        'unmarked_outlets_included': len(unmarked_tips),
+        'IsOutlet_nonterminal_points': len(flags_internal),
+        'radius_array': radius_name, 'radius_median': r_med,
+        'missing_radius_values_imputed_from_neighbors': imputed,
+        'minimum_effective_radius': float(radius.min()),
+        'radius_points_clamped': int(np.count_nonzero(radius[np.array(sorted(seen),dtype=int)] <= r_min + 1e-14)),
+        'Sidedness_present': any(x in ('Left', 'Right') for x in sides),
+    }
+    if flags_internal:
+        print(f'WARNING: {len(flags_internal)} IsOutlet flags are on internal graph nodes; '
+              'only true tree tips will be capped/named.')
+    if components_discarded:
+        print(f'WARNING: {components_discarded} disconnected centerline points omitted.')
+    return Graph(xyz, radius, sides, inlet, outlet, adj, root,
+                 parent, children, dist, seen, branches, tips, stats)
+
+
+def _rmf_basis(tangent, last_axis=None):
+    tangent = _unit(tangent)
+    if last_axis is not None:
+        axis = last_axis - tangent * np.dot(last_axis, tangent)
+        if _norm(axis) > 1e-8:
+            x = _unit(axis)
+            return x, _unit(np.cross(tangent, x))
+    reference = np.eye(3)[int(np.argmin(np.abs(tangent)))]
+    x = _unit(np.cross(reference, tangent))
+    return x, _unit(np.cross(tangent, x))
+
+
+def _resample_path(graph: Graph, path):
+    xyz = graph.xyz[path]
+    r = graph.radius[path]
+    xyz_new = [xyz[0]]
+    rad_new = [float(r[0])]
+    for j in range(1, len(path)):
+        a, b = xyz[j-1], xyz[j]
+        dist = _norm(b-a)
+        if dist <= MIN_CENTERLINE_STEP:
+            continue
+        max_step = min(MAX_RING_STEP, RING_STEP_RADIUS_FACTOR * max(min(r[j-1],r[j]), RADIUS_FLOOR_ABSOLUTE))
+        count = max(1, int(math.ceil(dist/max(max_step, 1e-6))))
+        for t in np.arange(1, count+1, dtype=float) / count:
+            xyz_new.append((1-t)*a + t*b)
+            rad_new.append(float((1-t)*r[j-1] + t*r[j]))
+    return np.asarray(xyz_new, dtype=np.float64), np.asarray(rad_new, dtype=np.float64)
+
+
+def _tube_mesh(centers, radii, resolution):
+    """Build a closed manifold tube with separate cross-section rings."""
+    k = len(centers)
+    if k < 2:
+        raise RuntimeError('Need 2 or more ring centers to loft a tube')
+    n = int(resolution)
+    theta = np.arange(n) * (2.0*np.pi/n)
+    c,s = np.cos(theta),np.sin(theta)
+    pts = np.empty((k*n+2,3), dtype=np.float64)
+    ring_lines = []
+    tangents = np.empty_like(centers)
+    tangents[0] = _unit(centers[1]-centers[0])
+    tangents[-1] = _unit(centers[-1]-centers[-2])
+    for j in range(1,k-1):
+        tangents[j] = _unit(_unit(centers[j]-centers[j-1]) + _unit(centers[j+1]-centers[j]), tangents[j-1])
+    axis = None
+    for i in range(k):
+        ax, ay = _rmf_basis(tangents[i], axis)
+        axis = ax
+        pts[i*n:(i+1)*n] = centers[i][None,:] + radii[i] * (c[:,None]*ax[None,:] + s[:,None]*ay[None,:])
+        ring_lines.append(pts[i*n:(i+1)*n].copy())
+    pts[k*n] = centers[0]
+    pts[k*n+1] = centers[-1]
+    tris = []
+    for j in range(k-1):
+        for i in range(n):
+            a=j*n+i; b=j*n+(i+1)%n; cc=(j+1)*n+(i+1)%n; d=(j+1)*n+i
+            tris.extend(((a,b,cc),(a,cc,d)))
+    for i in range(n):
+        tris.append((k*n, (i+1)%n, i))
+        tris.append((k*n+1, (k-1)*n+i, (k-1)*n+(i+1)%n))
+    face_np=np.asarray(tris, dtype=np.int64)
+    vtkpoints=vtk.vtkPoints();vtkpoints.SetData(numpy_to_vtk(pts,deep=True))
+    vtkcells=vtk.vtkCellArray()
+    vtkcells.SetData(
+        numpy_to_vtkIdTypeArray(np.arange(0, 3*(len(face_np)+1), 3, dtype=np.int64), deep=True),
+        numpy_to_vtkIdTypeArray(face_np.ravel(), deep=True)
+    )
+    mesh=vtk.vtkPolyData();mesh.SetPoints(vtkpoints);mesh.SetPolys(vtkcells)
+    return mesh,ring_lines
+
+
+def _make_debug_rings(rings):
+    points=vtk.vtkPoints();lines=vtk.vtkCellArray(); branchid=vtk.vtkIntArray();branchid.SetName('BranchID')
+    ring_index=vtk.vtkIntArray();ring_index.SetName('RingIndex')
+    for branch_idx, these in rings:
+        for j,r in enumerate(these):
+            first=points.GetNumberOfPoints()
+            for v in r:
+                points.InsertNextPoint(*[float(x) for x in v])
+            polyline=vtk.vtkPolyLine();polyline.GetPointIds().SetNumberOfIds(len(r)+1)
+            for i in range(len(r)):
+                polyline.GetPointIds().SetId(i,first+i)
+            polyline.GetPointIds().SetId(len(r),first)
+            lines.InsertNextCell(polyline)
+            branchid.InsertNextValue(branch_idx);ring_index.InsertNextValue(j)
+    poly=vtk.vtkPolyData();poly.SetPoints(points);poly.SetLines(lines)
+    poly.GetCellData().AddArray(branchid);poly.GetCellData().AddArray(ring_index)
+    return poly
+
+
+def _vtk_image_from_array(field, xyz_min, spacing):
+    # Numpy layout z,y,x; VTK scalar storage x-fastest.
+    nz,ny,nx=field.shape
+    image=vtk.vtkImageData()
+    image.SetDimensions(nx,ny,nz)
+    image.SetOrigin(*[float(x) for x in xyz_min])
+    image.SetSpacing(float(spacing),float(spacing),float(spacing))
+    vtkarr=numpy_to_vtk(np.ascontiguousarray(field).ravel(order='C'),deep=True)
+    vtkarr.SetName('UnionSignedDistance');image.GetPointData().SetScalars(vtkarr)
+    return image
+
+
+def _implicit_union(branch_meshes, g: Graph):
+    """Union all consecutive pairs of oriented circular cross sections.
+
+    This is an ANALYTIC implicit description of a closed truncated cone / tube
+    between each pair of circles. The frustum's cross section at axial t has
+    radius (1-t)*r0+t*r1. Two finite cap planes stop the volume at t=0,1.
+    Each frustum is *independent*, so even pathological long-branch lofts
+    cannot produce self-intersecting side triangles here. The final shape is
+    the minimum of all local implicit fields, never a global Delaunay mesh.
+
+    The branch VTPs remain saved as debug geometry, but the union itself does
+    not depend on vtkImplicitPolyDataDistance (which can misclassify winding
+    on folded polylines and can be prohibitively slow for thousands of rings).
+    """
+    tree_points=np.array(sorted(g.tree_nodes),dtype=int)
+    p=g.xyz[tree_points];r=g.radius[tree_points]
+    lower=np.min(p-r[:,None],axis=0)
+    upper=np.max(p+r[:,None],axis=0)
+    maxr=float(np.max(r))
+    padding=max(GRID_PADDING_RADII*maxr,GRID_PADDING_VOXELS*VOXEL_SPACING)
+    lower-=padding; upper+=padding
+    spacing=float(VOXEL_SPACING)
+    shape_xyz=np.ceil((upper-lower)/spacing).astype(int)+1
+    nv=int(np.prod(shape_xyz.astype(np.int64)))
+    if nv>MAX_GRID_VOXELS:
+        if not AUTO_COARSEN_GRID:
+            raise MemoryError(f'Grid would require {nv:,} samples; increase VOXEL_SPACING.')
+        spacing*=max(1.01,(nv/MAX_GRID_VOXELS)**(1/3)*1.03)
+        shape_xyz=np.ceil((upper-lower)/spacing).astype(int)+1
+        nv=int(np.prod(shape_xyz.astype(np.int64)))
+        while nv>MAX_GRID_VOXELS:
+            spacing*=1.03
+            shape_xyz=np.ceil((upper-lower)/spacing).astype(int)+1
+            nv=int(np.prod(shape_xyz.astype(np.int64)))
+        print(f'WARNING: grid auto-coarsened to {spacing:.6g}; thin branches may disappear.')
+    print(f'Implicit union grid: dims={tuple(map(int,shape_xyz))} samples={nv:,} '
+          f'spacing={spacing:.6g}; field ~{4*nv/1e6:.1f} MB')
+    shape=(int(shape_xyz[2]),int(shape_xyz[1]),int(shape_xyz[0]))
+    field=np.full(shape,np.float32(maxr*4+10*spacing),dtype=np.float32)
+    npieces=sum(len(centers)-1 for _,centers,_ in branch_meshes)
+    diag=[]
+    count=0
+    for bid,(_mesh,centers,radii) in enumerate(branch_meshes):
+        for j in range(len(centers)-1):
+            a=centers[j];b=centers[j+1]
+            ra=float(radii[j]);rb=float(radii[j+1])
+            axis=b-a
+            length=_norm(axis)
+            if length<MIN_CENTERLINE_STEP:
+                continue
+            axis=axis/length
+            expand=max(ra,rb)+3*spacing
+            mn=np.minimum(a,b)-expand
+            mx=np.maximum(a,b)+expand
+            lo=np.maximum(0,np.floor((mn-lower)/spacing).astype(int))
+            hi=np.minimum(shape_xyz-1,np.ceil((mx-lower)/spacing).astype(int))
+            if np.any(hi<lo):
+                continue
+            x=(lower[0]+np.arange(lo[0],hi[0]+1)*spacing)[None,None,:]
+            y=(lower[1]+np.arange(lo[1],hi[1]+1)*spacing)[None,:,None]
+            # Constrain temporary arrays to z-slabs for large proximate trunks.
+            for z0 in range(int(lo[2]),int(hi[2])+1,16):
+                z1=min(int(hi[2]),z0+15)
+                z=(lower[2]+np.arange(z0,z1+1)*spacing)[:,None,None]
+                axial=(x-a[0])*axis[0]+(y-a[1])*axis[1]+(z-a[2])*axis[2]
+                # Each cross section is perpendicular to this edge's direction.
+                radial=np.sqrt(
+                    ((x-a[0])-axial*axis[0])**2 +
+                    ((y-a[1])-axial*axis[1])**2 +
+                    ((z-a[2])-axial*axis[2])**2
+                )
+                t=np.clip(axial/length,0.0,1.0)
+                radius=ra+(rb-ra)*t
+                # Max of side and planar-end constraints: negative INSIDE.
+                local=np.maximum(np.maximum(radial-radius,-axial),axial-length)
+                sl=np.s_[z0:z1+1,lo[1]:hi[1]+1,lo[0]:hi[0]+1]
+                np.minimum(field[sl],local.astype(np.float32),out=field[sl])
+            diag.append({'piece_id':count,'branch_id':bid,'centerline_ring_pair':j,
+                         'length':float(length),'start_radius':ra,'end_radius':rb})
+            count+=1
+        if (bid+1)%10==0 or bid==0 or bid+1==len(branch_meshes):
+            print(f'  implicit union branches {bid+1}/{len(branch_meshes)} '
+                  f'({count}/{npieces} ring-pair pieces)')
+    if SURFACE_BLUR_SIGMA_VOXELS>0:
+        field=ndimage.gaussian_filter(field,SURFACE_BLUR_SIGMA_VOXELS,
+                                      mode='nearest',output=np.float32)
+    image=_vtk_image_from_array(field,lower,spacing)
+    contour=vtk.vtkFlyingEdges3D();contour.SetInputData(image)
+    contour.SetValue(0,0.0);contour.Update()
+    raw=contour.GetOutput()
+    if raw.GetNumberOfPolys()==0:
+        raise RuntimeError('Implicit union generated no surface: adjust voxel spacing')
+    clean=vtk.vtkCleanPolyData();clean.SetInputData(raw);clean.SetTolerance(0);clean.Update()
+    tri=vtk.vtkTriangleFilter();tri.SetInputConnection(clean.GetOutputPort());tri.Update()
+    norms=vtk.vtkPolyDataNormals();norms.SetInputConnection(tri.GetOutputPort())
+    norms.ConsistencyOn();norms.AutoOrientNormalsOn();norms.SplittingOff()
+    norms.ComputeCellNormalsOn();norms.ComputePointNormalsOff();norms.Update()
+    surface=vtk.vtkPolyData();surface.DeepCopy(norms.GetOutput())
+    return surface,image,spacing,diag
+
+
+def _topology(poly):
+    nf=poly.GetNumberOfPolys()
+    ef=vtk.vtkFeatureEdges();ef.SetInputData(poly)
+    ef.FeatureEdgesOff();ef.ManifoldEdgesOff();ef.BoundaryEdgesOn();ef.NonManifoldEdgesOn();ef.Update()
+    # Differentiate boundary and non-manifold edges in separate calls.
+    eb=vtk.vtkFeatureEdges();eb.SetInputData(poly);eb.FeatureEdgesOff()
+    eb.ManifoldEdgesOff();eb.NonManifoldEdgesOff();eb.BoundaryEdgesOn();eb.Update()
+    en=vtk.vtkFeatureEdges();en.SetInputData(poly);en.FeatureEdgesOff()
+    en.ManifoldEdgesOff();en.BoundaryEdgesOff();en.NonManifoldEdgesOn();en.Update()
+    cc=vtk.vtkPolyDataConnectivityFilter();cc.SetInputData(poly)
+    cc.SetExtractionModeToAllRegions();cc.ColorRegionsOn();cc.Update()
+    return {'triangles':nf,'points':poly.GetNumberOfPoints(),
+            'boundary_edges':eb.GetOutput().GetNumberOfCells(),
+            'nonmanifold_edges':en.GetOutput().GetNumberOfCells(),
+            'connected_regions':cc.GetNumberOfExtractedRegions()}
+
+
+def _remove_tiny_islands(surface, output_dir):
+    """Discard ONLY microscopic union discretization artifacts, with audit."""
+    conn=vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(surface);conn.SetExtractionModeToAllRegions()
+    conn.ColorRegionsOn();conn.Update()
+    count=conn.GetNumberOfExtractedRegions()
+    if count <= 1:
+        return surface,{'regions_before':int(count),'regions_removed':0,
+                        'triangles_removed':0}
+    sizes=np.array([int(conn.GetRegionSizes().GetValue(i)) for i in range(count)])
+    order=np.argsort(sizes)[::-1]
+    main=int(sizes[order[0]])
+    satellites=sizes[order[1:]]
+    # For this pipeline, a few dozen TRIANGLES detached from an otherwise
+    # hundreds-of-thousands-triangle fluid domain are almost always voxel
+    # noise. Larger separate regions could be meaningful vessels; preserve.
+    safe = (AUTO_REMOVE_TINY_UNION_ISLANDS and
+            max(satellites)<=max(12,main*TINY_ISLAND_MAX_FRACTION_OF_MAIN) and
+            np.sum(satellites)<=main*TINY_ISLAND_MAX_TOTAL_FRACTION)
+    if not safe and not EXTRACT_SINGLE_REGION_ONLY:
+        print(f'WARNING: output has {count} connected regions; largest {main} '
+              f'triangles; satellite sizes={sorted(satellites,reverse=True)[:10]}. '
+              'Not removing them automatically.')
+        return surface,{'regions_before':int(count),'regions_removed':0,
+                        'triangles_removed':0,'unresolved_region_sizes':satellites.tolist()}
+    choose=vtk.vtkPolyDataConnectivityFilter()
+    choose.SetInputData(surface);choose.SetExtractionModeToLargestRegion()
+    choose.Update()
+    tri=vtk.vtkTriangleFilter();tri.SetInputConnection(choose.GetOutputPort());tri.Update()
+    clean=vtk.vtkCleanPolyData()
+    clean.SetInputConnection(tri.GetOutputPort());clean.SetTolerance(0)
+    clean.Update()
+    kept=vtk.vtkPolyData();kept.DeepCopy(clean.GetOutput())
+    removed=int(np.sum(satellites))
+    print(f'NOTE: removed {count-1} tiny union islands ({removed} triangles), '
+          'retained the connected main fluid domain. Review the input '
+          'spacing if tiny real branches are disappearing.')
+    result={'regions_before':int(count),'regions_removed':int(count-1),
+            'triangles_removed':removed,'main_region_triangles':main,
+            'removed_region_sizes':satellites.tolist(),
+            'reason':'tiny disconnected voxel-shell artifacts; check resolution'}
+    return kept,result
+
+def _surface_quality_summary(poly):
+    pts=vtk_to_numpy(poly.GetPoints().GetData()).astype(np.float64)
+    tris=vtk_to_numpy(poly.GetPolys().GetConnectivityArray()).reshape(-1,3)
+    a,b,c=pts[tris[:,0]],pts[tris[:,1]],pts[tris[:,2]]
+    area=0.5*np.linalg.norm(np.cross(b-a,c-a),axis=1)
+    unique_faces=np.unique(np.sort(tris,axis=1),axis=0)
+    return {'triangle_count':int(len(tris)),
+            'zero_area_triangles':int(np.count_nonzero(area<1e-12)),
+            'duplicate_index_facets':int(len(tris)-len(unique_faces)),
+            'minimum_triangle_area':float(np.min(area)) if len(area) else None,
+            'triangle_area_p01':float(np.percentile(area,1)) if len(area) else None}
+
+
+
+def _cap_name(tip,g,numbering):
+    if tip==g.root:
+        return 'INLET'
+    side=g.sidedness[tip]
+    if side not in ('Left','Right'):
+        # Search upstream until an explicitly labeled branch is found.
+        cur=int(g.parent[tip])
+        while cur>=0:
+            if g.sidedness[cur] in ('Left','Right'):
+                side=g.sidedness[cur];break
+            cur=int(g.parent[cur])
+    if side not in ('Left','Right'):
+        side='Outlet'
+    numbering[side]+=1
+    return f'{side}{numbering[side]}'
+
+
+def _label_caps(surface: vtk.vtkPolyData,g:Graph,spacing:float):
+    """Label approximately planar terminal discs of extracted implicit union.
+
+    Uses a connected patch of near-end, outward-normal triangles, rather than
+    allowing unrelated nearby branches to be relabeled based only on location.
+    """
+    all_ends=[g.root]+sorted(g.tips,key=lambda i:(g.sidedness[i],g.distances[i],i))
+    renames=Counter()
+    names=[]
+    for t in all_ends:
+        names.append(_cap_name(t,g,renames))
+    xyz=vtk_to_numpy(surface.GetPoints().GetData()).astype(np.float64)
+    f=np.asarray(vtk_to_numpy(surface.GetPolys().GetConnectivityArray()),dtype=np.int64).reshape(-1,3)
+    fc=xyz[f].mean(axis=1)
+    v0=xyz[f[:,1]]-xyz[f[:,0]];v1=xyz[f[:,2]]-xyz[f[:,0]]
+    normals=np.cross(v0,v1);mag=np.linalg.norm(normals,axis=1)
+    normals=normals/np.maximum(mag[:,None],1e-20)
+    ids=np.ones(len(f),dtype=np.int32)   # wall = 1
+    mapping={1:'wall'}
+    diag=[]
+    # Extracted surf triangles located close to the tube terminal plane, with
+    # predominantly terminal-normal orientation, should make a cap patch.
+    for ci,(tip,name) in enumerate(zip(all_ends,names),start=2):
+        neigh=(g.children[tip][0] if tip==g.root else int(g.parent[tip]))
+        # Outward from the reconstructed fluid domain at this terminal.
+        outward=_unit(g.xyz[tip]-g.xyz[neigh])
+        base=g.xyz[tip]
+        relative=fc-base
+        along=relative @ outward
+        rr=np.linalg.norm(relative-along[:,None]*outward,axis=1)
+        radius=float(g.radius[tip])
+        plane_tol=max(CAP_PLANE_TOL_VOXELS*spacing,CAP_PLANE_TOL_RADIUS_FACTOR*radius)
+        possible=(np.abs(along)<plane_tol)&(rr<CAP_MAX_RADIAL_FACTOR*radius)&((normals@outward)>CAP_NORMAL_ALIGNMENT_MIN)
+        # Label only a local connected island. Isolated labels from a nearby
+        # branch are possible; report counts and let user inspect result.
+        indices=np.flatnonzero(possible & (ids==1))
+        ids[indices]=ci
+        mapping[ci]=name
+        diag.append({'name':name,'face_id':ci,'point_id':int(tip),'marked_is_outlet':bool(g.is_outlet[tip]),
+                     'side':g.sidedness[tip], 'x':float(base[0]),'y':float(base[1]),'z':float(base[2]),
+                     'radius':radius,'surface_triangles_labeled':int(len(indices)),
+                     'classification_plane_tol':plane_tol,'zero_cells_warning':len(indices)==0})
+    idarr=numpy_to_vtk(ids,deep=True,array_type=vtk.VTK_INT);idarr.SetName('ModelFaceID')
+    surface.GetCellData().AddArray(idarr)
+    return mapping,diag
+
+
+def _write_facenames(path:Path,names):
+    with path.open('w',encoding='utf-8') as f:
+        f.write('global gPolyDataFaceNames\n\n')
+        for fid,name in sorted(names.items()):
+            f.write(f'set gPolyDataFaceNames({fid}) {name}\n')
+
+
+def _export_boundary_surfaces(surface,mapping,outdir):
+    """Export each face separately; these are face-tag previews, NOT a volume mesh."""
+    faceids=vtk_to_numpy(surface.GetCellData().GetArray('ModelFaceID'))
+    for fid,name in sorted(mapping.items()):
+        cells=np.flatnonzero(faceids==fid)
+        if len(cells)==0:
+            continue
+        arr=vtk.vtkIdTypeArray();arr.SetNumberOfValues(len(cells))
+        for i,c in enumerate(cells):
+            arr.SetValue(i,int(c))
+        sel=vtk.vtkSelectionNode();sel.SetFieldType(vtk.vtkSelectionNode.CELL)
+        sel.SetContentType(vtk.vtkSelectionNode.INDICES);sel.SetSelectionList(arr)
+        selection=vtk.vtkSelection();selection.AddNode(sel)
+        extract=vtk.vtkExtractSelection();extract.SetInputData(0,surface)
+        extract.SetInputData(1,selection);extract.Update()
+        geom=vtk.vtkGeometryFilter();geom.SetInputConnection(extract.GetOutputPort());geom.Update()
+        result=vtk.vtkPolyData();result.DeepCopy(geom.GetOutput())
+        _write_vtp(result,outdir/(name+'.vtp'))
+
+
+def reconstruct(input_path, output_dir):
+    input_path=Path(input_path).expanduser().resolve()
+    output_dir=Path(output_dir).expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f'Centerline file not found: {input_path}')
+    output_dir.mkdir(parents=True,exist_ok=True)
+    reader=vtk.vtkXMLPolyDataReader();reader.SetFileName(str(input_path));reader.Update()
+    poly=reader.GetOutput()
+    if poly.GetNumberOfLines()==0:
+        raise RuntimeError('Expected a centerline VTP containing polyline cells, not a surface')
+    print('Reading trimmed centerlines:',input_path)
+    graph=_make_graph(poly)
+    print('Graph:',json.dumps(graph.stats,indent=2))
+    meshes=[];debug_rings=[];tube_append=vtk.vtkAppendPolyData();summary=[]
+    for index,path in enumerate(graph.branches):
+        centers,radii=_resample_path(graph,path)
+        if len(centers)<2:
+            continue
+        tube,rings=_tube_mesh(centers,radii,CIRCLE_RESOLUTION)
+        # Tube mesh per path, never global all-rings Delaunay.
+        meshes.append((tube,centers,radii))
+        if WRITE_UNMERGED_TUBES:
+            label=vtk.vtkIntArray();label.SetName('BranchID')
+            label.SetNumberOfTuples(tube.GetNumberOfCells());label.Fill(index)
+            tube.GetCellData().AddArray(label)
+            tube_append.AddInputData(tube)
+        if WRITE_RING_DEBUG:
+            debug_rings.append((index,rings))
+        start,end=path[0],path[-1]
+        summary.append({'branch_id':index,'start_point_id':start,'end_point_id':end,
+                        'start_x':graph.xyz[start,0],'start_y':graph.xyz[start,1],'start_z':graph.xyz[start,2],
+                        'end_x':graph.xyz[end,0],'end_y':graph.xyz[end,1],'end_z':graph.xyz[end,2],
+                        'num_centerline_points':len(path),'num_loft_rings':len(centers),
+                        'length':float(sum(_norm(b-a) for a,b in zip(centers[:-1],centers[1:]))),
+                        'minimum_radius':float(np.min(radii)),
+                        'maximum_radius':float(np.max(radii)),
+                        'starts_at_junction':len(graph.children[start])>=2,
+                        'ends_at_junction':len(graph.children[end])>=2})
+    if not meshes:
+        raise RuntimeError('No reconstructible branches were found')
+    _write_csv(output_dir/'branch_summary.csv',summary,list(summary[0]))
+    if WRITE_UNMERGED_TUBES:
+        tube_append.Update()
+        _write_vtp(tube_append.GetOutput(),output_dir/'individual_lofted_tubes_DEBUG_ONLY.vtp')
+    if WRITE_RING_DEBUG:
+        _write_vtp(_make_debug_rings(debug_rings),output_dir/'oriented_cross_section_rings.vtp')
+    print('Constructed',len(meshes),'independent branch loft previews;',
+          'combining successive ring pairs through an implicit geometric UNION')
+    surface,image,spacing,union_diag=_implicit_union(meshes,graph)
+    if WRITE_UNION_DISTANCE_FIELD_VTI:
+        _write_vti(image,output_dir/'union_signed_distance.vti')
+    initial_quality=_topology(surface)
+    print('Union topology:',initial_quality)
+    surface,island_report=_remove_tiny_islands(surface,output_dir)
+    mapping, cap_diag=_label_caps(surface,graph,spacing)
+    path_out=output_dir/'PA_cylindrical_reconstructed_closed.vtp'
+    _write_vtp(surface,path_out)
+    _write_facenames(Path(str(path_out)+'.facenames'),mapping)
+    _write_csv(output_dir/'terminal_cap_report.csv',cap_diag,list(cap_diag[0]))
+    _export_boundary_surfaces(surface,mapping,output_dir/'face_surfaces_preview')
+    final_quality=_topology(surface)
+    surface_quality=_surface_quality_summary(surface)
+    report={'input':str(input_path),'output':str(path_out),'graph':graph.stats,
+            'loft_tubes':len(meshes),'circle_resolution':CIRCLE_RESOLUTION,
+            'voxel_spacing_requested':VOXEL_SPACING,'voxel_spacing_used':spacing,
+            'implicit_union':{'tube_sample_roi':union_diag},
+            'topology':final_quality,'surface_quality':surface_quality,
+            'island_cleanup':island_report,'face_names':mapping,
+            'terminal_caps':cap_diag,
+            'warnings':[
+              'Implicit surface terminal caps are voxel-approximated, not mathematically flat.',
+              'ModelFaceID cap labeling is geometric and requires visual verification.',
+              'Watertight edge topology does NOT rule out self-intersection or inversion.',
+              'This output is a surface candidate, NOT a certified Gmsh/SimVascular volume mesh.'
+            ]}
+    if graph.stats['radius_points_clamped']:
+        report['warnings'].append(f"Clamped {graph.stats['radius_points_clamped']} very small/invalid input radii")
+    if any(x['surface_triangles_labeled']==0 for x in cap_diag):
+        report['warnings'].append('Some named end caps have no labeled cells; increase grid resolution or inspect orientation')
+    if surface_quality['zero_area_triangles'] or surface_quality['duplicate_index_facets']:
+        report['warnings'].append('Final output contains degenerate or duplicated triangles')
+    if final_quality['connected_regions']!=1:
+        report['warnings'].append('Output has multiple disconnected surface regions')
+    if final_quality['boundary_edges'] or final_quality['nonmanifold_edges']:
+        report['warnings'].append('Final mesh is not a closed 2-manifold by edge count')
+    (output_dir/'reconstruction_report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+    print('\nFinal surface:',path_out)
+    print('Final topology:',final_quality)
+    print('Surface QA:',surface_quality)
+    print('Caps:',len(cap_diag),' zero-labeled:',sum(x['zero_cells_warning'] for x in cap_diag))
+    print('Diagnostics:',output_dir)
+    return path_out,report
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input',default=CENTERLINE_VTP,help='Trimmed centerlines VTP')
+    parser.add_argument('--output-dir',default=OUTPUT_DIR)
+    parser.add_argument('--spacing',type=float,default=None,help='Override global voxel spacing')
+    parser.add_argument('--circle-resolution',type=int,default=None)
+    parser.add_argument('--radius-floor',type=float,default=None)
+    args=parser.parse_args()
+    global VOXEL_SPACING,CIRCLE_RESOLUTION,RADIUS_FLOOR_ABSOLUTE
+    if args.spacing is not None:
+        if args.spacing<=0:parser.error('--spacing must be positive')
+        VOXEL_SPACING=args.spacing
+    if args.circle_resolution is not None:
+        if args.circle_resolution<8:parser.error('circle resolution must be >=8')
+        CIRCLE_RESOLUTION=args.circle_resolution
+    if args.radius_floor is not None:
+        if args.radius_floor<=0:parser.error('radius floor must be >0')
+        RADIUS_FLOOR_ABSOLUTE=args.radius_floor
+    reconstruct(args.input,args.output_dir)
+
+
+if __name__=='__main__':
+    main()
