@@ -216,6 +216,78 @@ WRITE_CAPPED_OUTPUT = True
 REGENERATE_GLOBAL_IDS = True
 
 
+
+# ============================================================
+# FINAL MESH-QUALITY / SPIKE CLEANUP SETTINGS
+# ============================================================
+#
+# After the centerline-driven pruning/capping workflow is complete, run the
+# VTK equivalent of ParaView's "Mesh Quality" filter on the final surface.
+# Connected groups of triangles whose Quality exceeds the threshold are
+# treated as suspect spike / sliver regions.
+#
+# For each suspect group:
+#   1) find the nearest location on the TRIMMED centerline,
+#   2) use the local centerline tangent to orient a vtkBox,
+#   3) size the box from the local centerline Radius,
+#   4) clip AWAY the inside of that box,
+#   5) keep only the surface still connected to the pulmonary-artery inlet.
+#
+# Because the box spans the whole local vessel cross-section, the upstream
+# box face acts like a clean transverse plane cut and the distal spike/piece
+# becomes disconnected and is discarded.
+ENABLE_MESH_QUALITY_CLEANUP = True
+
+# SimVascular meshing failure threshold requested for this workflow.
+MESH_QUALITY_THRESHOLD = 1.0e6
+
+# ParaView/VTK Mesh Quality supports several triangle measures.  "AspectRatio"
+# is used here because very skinny/sliver triangles become very large.
+# If your ParaView Mesh Quality panel is using a different measure, change
+# this string to one of the supported names in configure_mesh_quality_filter().
+MESH_QUALITY_TRIANGLE_MEASURE = "AspectRatio"
+
+# Run the cleanup on the capped model when caps are being written, because
+# cap generation itself can create a rare bad triangle. If capped output is
+# disabled, the cleanup automatically uses the final open surface instead.
+MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE = True
+
+# Oriented removal box dimensions.  These are HALF-widths expressed as
+# multiples of the local centerline Radius.
+#
+# radial half-width must exceed the vessel radius so the box fully severs the
+# vessel rather than merely punching a rectangular side hole.
+QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR = 1.75
+
+# The box is centered at the nearest centerline location.  Therefore this
+# axial half-length also controls how far toward the parent vessel the new
+# retained opening is moved away from the bad elements.
+QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR = 1.25
+
+# Multiple disconnected bad-cell clusters can belong to the same spike.
+# If their proposed box centers are closer than this many local radii, merge
+# them into a single box to avoid repeatedly chopping the same location.
+QUALITY_BOX_MERGE_DISTANCE_FACTOR = 1.25
+
+# A single cleanup pass is intentionally conservative.  The script reports
+# any Quality > threshold cells that remain afterward so they can be inspected
+# before deciding whether a second pass is desirable.
+MESH_QUALITY_CLEANUP_PASSES = 1
+
+# Final open output after bad-element boxes have been clipped away.  This is
+# intentionally OPEN at any quality-cleanup locations.
+OUTPUT_QUALITY_CLEANED_FILE = r"C:\path\to\Pulmonary_Artery_Surface_Quality_Cleaned_Open.vtp"
+
+# Debug: all cells above MESH_QUALITY_THRESHOLD BEFORE cleanup.
+BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Bad_Quality_Cells_Debug.vtp"
+
+# Debug: oriented boxes actually used for quality cleanup.
+QUALITY_BOXES_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Quality_Clip_Boxes_Debug.vtp"
+
+# Debug: any cells still above threshold AFTER the cleanup pass(es).
+REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Remaining_Bad_Quality_Cells_Debug.vtp"
+
+
 # ============================================================
 # BASIC VTK I/O
 # ============================================================
@@ -2575,6 +2647,760 @@ def regenerate_global_ids(surface):
     cd.AddArray(elem_ids)
 
 
+
+# ============================================================
+# FINAL MESH-QUALITY / SPIKE CLEANUP HELPERS
+# ============================================================
+
+def configure_mesh_quality_filter(mesh_quality):
+    """Configure vtkMeshQuality to match the requested triangle measure."""
+
+    name = str(MESH_QUALITY_TRIANGLE_MEASURE).strip().lower().replace(" ", "")
+
+    setters = {
+        "aspectratio": mesh_quality.SetTriangleQualityMeasureToAspectRatio,
+        "edgeratio": mesh_quality.SetTriangleQualityMeasureToEdgeRatio,
+        "radiusratio": mesh_quality.SetTriangleQualityMeasureToRadiusRatio,
+        "aspectfrobenius": mesh_quality.SetTriangleQualityMeasureToAspectFrobenius,
+        "condition": mesh_quality.SetTriangleQualityMeasureToCondition,
+        "scaledjacobian": mesh_quality.SetTriangleQualityMeasureToScaledJacobian,
+        "shape": mesh_quality.SetTriangleQualityMeasureToShape,
+        "distortion": mesh_quality.SetTriangleQualityMeasureToDistortion,
+        "minangle": mesh_quality.SetTriangleQualityMeasureToMinAngle,
+        "maxangle": mesh_quality.SetTriangleQualityMeasureToMaxAngle,
+        "equiangleskew": mesh_quality.SetTriangleQualityMeasureToEquiangleSkew,
+    }
+
+    if name not in setters:
+        raise RuntimeError(
+            "Unsupported MESH_QUALITY_TRIANGLE_MEASURE '{}'. "
+            "Supported choices are: {}"
+            .format(
+                MESH_QUALITY_TRIANGLE_MEASURE,
+                ", ".join(sorted(setters.keys()))
+            )
+        )
+
+    setters[name]()
+
+
+def compute_mesh_quality(surface):
+    """Return a PolyData copy carrying vtkMeshQuality's cell-data Quality."""
+
+    quality_filter = vtk.vtkMeshQuality()
+    quality_filter.SetInputData(surface)
+    configure_mesh_quality_filter(quality_filter)
+    quality_filter.Update()
+
+    out = vtk.vtkPolyData()
+    out.DeepCopy(quality_filter.GetOutput())
+
+    quality = out.GetCellData().GetArray("Quality")
+
+    if quality is None:
+        raise RuntimeError(
+            "vtkMeshQuality did not create the expected cell-data array 'Quality'."
+        )
+
+    return out
+
+
+def find_bad_quality_cell_ids(quality_surface):
+    """Return cells with Quality > threshold, including non-finite values."""
+
+    quality = quality_surface.GetCellData().GetArray("Quality")
+
+    if quality is None:
+        raise RuntimeError("Quality array is missing from quality surface.")
+
+    bad = set()
+
+    for cell_id in range(quality_surface.GetNumberOfCells()):
+
+        value = float(quality.GetTuple1(cell_id))
+
+        if (not math.isfinite(value)) or value > MESH_QUALITY_THRESHOLD:
+            bad.add(cell_id)
+
+    return bad
+
+
+def cluster_bad_quality_cells(surface, bad_ids):
+    """Group bad cells that touch through at least one mesh point."""
+
+    if len(bad_ids) == 0:
+        return []
+
+    surface.BuildLinks()
+
+    remaining = set(bad_ids)
+    clusters = []
+    point_cells = vtk.vtkIdList()
+
+    while remaining:
+
+        seed = remaining.pop()
+        stack = [seed]
+        cluster = {seed}
+
+        while stack:
+
+            cell_id = stack.pop()
+            cell = surface.GetCell(cell_id)
+
+            for local_id in range(cell.GetNumberOfPoints()):
+
+                point_id = cell.GetPointId(local_id)
+                point_cells.Reset()
+                surface.GetPointCells(point_id, point_cells)
+
+                for i in range(point_cells.GetNumberOfIds()):
+
+                    neighbor_id = int(point_cells.GetId(i))
+
+                    if neighbor_id in remaining:
+                        remaining.remove(neighbor_id)
+                        cluster.add(neighbor_id)
+                        stack.append(neighbor_id)
+
+        clusters.append(cluster)
+
+    return clusters
+
+
+def triangle_area_and_centroid(surface, cell_id):
+
+    cell = surface.GetCell(cell_id)
+
+    if cell.GetNumberOfPoints() != 3:
+        return 0.0, (0.0, 0.0, 0.0)
+
+    p0 = point_tuple(surface, cell.GetPointId(0))
+    p1 = point_tuple(surface, cell.GetPointId(1))
+    p2 = point_tuple(surface, cell.GetPointId(2))
+
+    e1 = vec_sub(p1, p0)
+    e2 = vec_sub(p2, p0)
+
+    area = 0.5 * magnitude(cross(e1, e2))
+
+    centroid = (
+        (p0[0] + p1[0] + p2[0]) / 3.0,
+        (p0[1] + p1[1] + p2[1]) / 3.0,
+        (p0[2] + p1[2] + p2[2]) / 3.0
+    )
+
+    return area, centroid
+
+
+def summarize_bad_quality_cluster(quality_surface, cluster_ids, cluster_index):
+    """Area-weighted location and quality summary of one bad-cell cluster."""
+
+    quality = quality_surface.GetCellData().GetArray("Quality")
+
+    weighted = [0.0, 0.0, 0.0]
+    total_area = 0.0
+    max_quality = -float("inf")
+
+    # Fallback if all bad triangles are numerically zero-area.
+    fallback = [0.0, 0.0, 0.0]
+    fallback_count = 0
+
+    for cell_id in cluster_ids:
+
+        q = float(quality.GetTuple1(cell_id))
+
+        if not math.isfinite(q):
+            max_quality = float("inf")
+        elif q > max_quality:
+            max_quality = q
+
+        area, centroid = triangle_area_and_centroid(
+            quality_surface,
+            cell_id
+        )
+
+        fallback[0] += centroid[0]
+        fallback[1] += centroid[1]
+        fallback[2] += centroid[2]
+        fallback_count += 1
+
+        if area > 0.0 and math.isfinite(area):
+            weighted[0] += area * centroid[0]
+            weighted[1] += area * centroid[1]
+            weighted[2] += area * centroid[2]
+            total_area += area
+
+    if total_area > 0.0:
+        centroid = (
+            weighted[0] / total_area,
+            weighted[1] / total_area,
+            weighted[2] / total_area
+        )
+    else:
+        centroid = (
+            fallback[0] / float(fallback_count),
+            fallback[1] / float(fallback_count),
+            fallback[2] / float(fallback_count)
+        )
+
+    return {
+        "cluster_id": int(cluster_index),
+        "cell_ids": set(cluster_ids),
+        "num_cells": len(cluster_ids),
+        "centroid": centroid,
+        "surface_area": total_area,
+        "max_quality": max_quality
+    }
+
+
+def build_centerline_cell_locator(centerline):
+
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(centerline)
+    locator.BuildLocator()
+
+    return locator
+
+
+def closest_centerline_frame(centerline, locator, query_point):
+    """
+    Find the closest location on a centerline polyline and return a local
+    tangent plus linearly interpolated Radius.
+    """
+
+    closest = [0.0, 0.0, 0.0]
+    cell_id = vtk.reference(0)
+    sub_id = vtk.reference(0)
+    dist2 = vtk.reference(0.0)
+
+    locator.FindClosestPoint(
+        query_point,
+        closest,
+        cell_id,
+        sub_id,
+        dist2
+    )
+
+    cid = int(cell_id)
+    sid = int(sub_id)
+
+    if cid < 0 or cid >= centerline.GetNumberOfCells():
+        raise RuntimeError("Could not locate a valid nearest centerline cell.")
+
+    cell = centerline.GetCell(cid)
+    npts = cell.GetNumberOfPoints()
+
+    if npts < 2:
+        raise RuntimeError(
+            "Nearest centerline cell {} has fewer than two points."
+            .format(cid)
+        )
+
+    # For vtkPolyLine cells, subId identifies the line segment. Clamp for
+    # safety because different VTK versions can report an endpoint subId.
+    if sid < 0:
+        sid = 0
+    if sid > npts - 2:
+        sid = npts - 2
+
+    id0 = cell.GetPointId(sid)
+    id1 = cell.GetPointId(sid + 1)
+
+    p0 = point_tuple(centerline, id0)
+    p1 = point_tuple(centerline, id1)
+
+    segment = vec_sub(p1, p0)
+    seg_len2 = dot(segment, segment)
+
+    if seg_len2 <= PLANE_EPS * PLANE_EPS:
+        raise RuntimeError(
+            "Nearest centerline segment in cell {} has zero length."
+            .format(cid)
+        )
+
+    tangent = normalize(segment)
+
+    # Interpolate Radius at the closest point projected onto this segment.
+    rel = vec_sub(tuple(closest), p0)
+    t = dot(rel, segment) / seg_len2
+
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+
+    radius_array = centerline.GetPointData().GetArray(RADIUS_ARRAY)
+
+    if radius_array is None:
+        raise RuntimeError(
+            "Trimmed centerline is missing required Radius array '{}'."
+            .format(RADIUS_ARRAY)
+        )
+
+    r0 = float(radius_array.GetTuple1(id0))
+    r1 = float(radius_array.GetTuple1(id1))
+
+    valid0 = math.isfinite(r0) and r0 > 0.0
+    valid1 = math.isfinite(r1) and r1 > 0.0
+
+    if valid0 and valid1:
+        radius = r0 + t * (r1 - r0)
+    elif valid0:
+        radius = r0
+    elif valid1:
+        radius = r1
+    else:
+        raise RuntimeError(
+            "Nearest centerline segment has no valid Radius values."
+        )
+
+    return {
+        "center": (
+            float(closest[0]),
+            float(closest[1]),
+            float(closest[2])
+        ),
+        "tangent": tangent,
+        "radius": float(radius),
+        "centerline_cell_id": cid,
+        "centerline_sub_id": sid,
+        "distance_to_centerline": math.sqrt(float(dist2))
+    }
+
+
+def make_quality_box_plan(cluster_summary, centerline_frame):
+
+    plan = dict(cluster_summary)
+    plan.update(centerline_frame)
+
+    plan["radial_half_width"] = (
+        plan["radius"]
+        * QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR
+    )
+
+    plan["axial_half_length"] = (
+        plan["radius"]
+        * QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR
+    )
+
+    return plan
+
+
+def merge_nearby_quality_box_plans(plans):
+    """Merge duplicate boxes proposed for the same local centerline region."""
+
+    merged = []
+
+    # Worst quality first, so the representative box for a merged group is
+    # anchored to the most problematic cluster.
+    plans_sorted = sorted(
+        plans,
+        key=lambda p: (
+            float("inf") if not math.isfinite(p["max_quality"])
+            else p["max_quality"]
+        ),
+        reverse=True
+    )
+
+    for plan in plans_sorted:
+
+        found = None
+
+        for existing in merged:
+
+            merge_distance = (
+                QUALITY_BOX_MERGE_DISTANCE_FACTOR
+                * max(plan["radius"], existing["radius"])
+            )
+
+            if distance(plan["center"], existing["center"]) <= merge_distance:
+                found = existing
+                break
+
+        if found is None:
+            plan["merged_cluster_ids"] = [plan["cluster_id"]]
+            plan["merged_bad_cell_count"] = plan["num_cells"]
+            merged.append(plan)
+        else:
+            found["merged_cluster_ids"].append(plan["cluster_id"])
+            found["merged_bad_cell_count"] += plan["num_cells"]
+
+            if (
+                not math.isfinite(plan["max_quality"])
+                or plan["max_quality"] > found["max_quality"]
+            ):
+                found["max_quality"] = plan["max_quality"]
+
+    return merged
+
+
+def build_box_world_to_local_transform(center, tangent):
+    """Create transform mapping world coordinates into the oriented box frame."""
+
+    # Choose a reference vector not parallel to the tangent.
+    if abs(tangent[0]) < 0.9:
+        reference = (1.0, 0.0, 0.0)
+    else:
+        reference = (0.0, 1.0, 0.0)
+
+    u = normalize(cross(tangent, reference))
+    v = normalize(cross(tangent, u))
+
+    matrix = vtk.vtkMatrix4x4()
+    matrix.Identity()
+
+    # Rows form the world -> local rotation. Translation moves the box center
+    # to the local origin. vtkImplicitFunction applies this transform to each
+    # input point before evaluating the axis-aligned vtkBox.
+    for j in range(3):
+        matrix.SetElement(0, j, u[j])
+        matrix.SetElement(1, j, v[j])
+        matrix.SetElement(2, j, tangent[j])
+
+    matrix.SetElement(0, 3, -dot(u, center))
+    matrix.SetElement(1, 3, -dot(v, center))
+    matrix.SetElement(2, 3, -dot(tangent, center))
+
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(matrix)
+
+    return transform, u, v
+
+
+def build_oriented_vtk_box(plan):
+
+    box = vtk.vtkBox()
+
+    radial = float(plan["radial_half_width"])
+    axial = float(plan["axial_half_length"])
+
+    box.SetBounds(
+        -radial, radial,
+        -radial, radial,
+        -axial, axial
+    )
+
+    transform, u, v = build_box_world_to_local_transform(
+        plan["center"],
+        plan["tangent"]
+    )
+
+    box.SetTransform(transform)
+
+    return box, u, v
+
+
+def clip_out_quality_box(surface, plan):
+    """
+    Remove the inside of one oriented box using vtkBoxClipDataSet.
+
+    This is intentionally closer to ParaView's Box clipping behavior than an
+    implicit vtkBox passed to vtkClipPolyData.  vtkBoxClipDataSet geometrically
+    cuts cells against the six box planes, so a long skinny triangle cannot
+    simply "jump across" the box because all of its original vertices happened
+    to lie outside.
+    """
+
+    center = plan["center"]
+    tangent = plan["tangent"]
+    radial = float(plan["radial_half_width"])
+    axial = float(plan["axial_half_length"])
+
+    _, u, v = build_box_world_to_local_transform(
+        center,
+        tangent
+    )
+
+    # Six outward-facing planes of the oriented box.
+    normals = [
+        vec_scale(u, -1.0),
+        u,
+        vec_scale(v, -1.0),
+        v,
+        vec_scale(tangent, -1.0),
+        tangent
+    ]
+
+    origins = [
+        vec_add(center, vec_scale(u, -radial)),
+        vec_add(center, vec_scale(u, radial)),
+        vec_add(center, vec_scale(v, -radial)),
+        vec_add(center, vec_scale(v, radial)),
+        vec_add(center, vec_scale(tangent, -axial)),
+        vec_add(center, vec_scale(tangent, axial))
+    ]
+
+    box_clipper = vtk.vtkBoxClipDataSet()
+    box_clipper.SetInputData(surface)
+    box_clipper.SetOrientation(1)
+    box_clipper.SetBoxClip(
+        normals[0], origins[0],
+        normals[1], origins[1],
+        normals[2], origins[2],
+        normals[3], origins[3],
+        normals[4], origins[4],
+        normals[5], origins[5]
+    )
+
+    # Port 0 = inside the box. Port 1 = the portion clipped away/outside.
+    # We want to REMOVE the box interior and retain port 1.
+    box_clipper.GenerateClippedOutputOn()
+    box_clipper.Update()
+
+    outside_grid = box_clipper.GetOutput(1)
+
+    geometry = vtk.vtkGeometryFilter()
+    geometry.SetInputData(outside_grid)
+    geometry.Update()
+
+    out = vtk.vtkPolyData()
+    out.DeepCopy(geometry.GetOutput())
+
+    out = clean_polydata(out, MERGE_TOLERANCE)
+    out = triangulate_polydata(out)
+
+    return out
+
+
+def make_debug_box_polydata(plan, box_index):
+    """Create an oriented cube surface for visual QC in ParaView."""
+
+    radial = float(plan["radial_half_width"])
+    axial = float(plan["axial_half_length"])
+
+    cube = vtk.vtkCubeSource()
+    cube.SetBounds(
+        -radial, radial,
+        -radial, radial,
+        -axial, axial
+    )
+    cube.Update()
+
+    _, u, v = build_box_world_to_local_transform(
+        plan["center"],
+        plan["tangent"]
+    )
+
+    # Local -> world matrix (columns are local basis vectors).
+    matrix = vtk.vtkMatrix4x4()
+    matrix.Identity()
+
+    for i in range(3):
+        matrix.SetElement(i, 0, u[i])
+        matrix.SetElement(i, 1, v[i])
+        matrix.SetElement(i, 2, plan["tangent"][i])
+        matrix.SetElement(i, 3, plan["center"][i])
+
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(matrix)
+
+    tf = vtk.vtkTransformPolyDataFilter()
+    tf.SetInputConnection(cube.GetOutputPort())
+    tf.SetTransform(transform)
+    tf.Update()
+
+    out = vtk.vtkPolyData()
+    out.DeepCopy(tf.GetOutput())
+
+    arrays = [
+        ("QualityBoxIndex", int(box_index), vtk.vtkIntArray),
+        ("BadClusterId", int(plan["cluster_id"]), vtk.vtkIntArray),
+        ("CenterlineCellId", int(plan["centerline_cell_id"]), vtk.vtkIntArray),
+        ("BadCellCount", int(plan.get("merged_bad_cell_count", plan["num_cells"])), vtk.vtkIntArray),
+        ("LocalRadius", float(plan["radius"]), vtk.vtkDoubleArray),
+        ("MaxBadQuality", float(plan["max_quality"]), vtk.vtkDoubleArray),
+        ("DistanceToCenterline", float(plan["distance_to_centerline"]), vtk.vtkDoubleArray),
+    ]
+
+    for name, value, array_type in arrays:
+        arr = array_type()
+        arr.SetName(name)
+        arr.SetNumberOfTuples(out.GetNumberOfCells())
+        for i in range(out.GetNumberOfCells()):
+            arr.SetTuple1(i, value)
+        out.GetCellData().AddArray(arr)
+
+    return out
+
+
+def extract_bad_quality_debug_surface(quality_surface, bad_ids):
+
+    if len(bad_ids) == 0:
+        return vtk.vtkPolyData()
+
+    return extract_cells_by_flag(
+        quality_surface,
+        bad_ids,
+        True
+    )
+
+
+def run_mesh_quality_spike_cleanup(surface, centerline, inlet_xyz):
+    """
+    Detect Quality > threshold cells, group them, build oriented clipping boxes
+    from the nearest centerline Radius/tangent, and keep the inlet-connected
+    surface after each box.  Returns the cleaned surface plus debug objects.
+    """
+
+    working = vtk.vtkPolyData()
+    working.DeepCopy(surface)
+
+    centerline_locator = build_centerline_cell_locator(centerline)
+
+    all_debug_boxes = []
+    first_bad_debug = None
+
+    for cleanup_pass in range(int(MESH_QUALITY_CLEANUP_PASSES)):
+
+        quality_surface = compute_mesh_quality(working)
+        bad_ids = find_bad_quality_cell_ids(quality_surface)
+
+        print("")
+        print("============================================")
+        print(
+            "MESH QUALITY CLEANUP PASS {}/{}"
+            .format(
+                cleanup_pass + 1,
+                MESH_QUALITY_CLEANUP_PASSES
+            )
+        )
+        print("============================================")
+        print("Quality measure:", MESH_QUALITY_TRIANGLE_MEASURE)
+        print("Quality threshold:", MESH_QUALITY_THRESHOLD)
+        print("Bad cells found:", len(bad_ids))
+
+        if cleanup_pass == 0:
+            first_bad_debug = extract_bad_quality_debug_surface(
+                quality_surface,
+                bad_ids
+            )
+
+        if len(bad_ids) == 0:
+            break
+
+        clusters = cluster_bad_quality_cells(
+            quality_surface,
+            bad_ids
+        )
+
+        print("Connected bad-cell clusters:", len(clusters))
+
+        plans = []
+
+        for cluster_index, cluster_ids in enumerate(clusters):
+
+            summary = summarize_bad_quality_cluster(
+                quality_surface,
+                cluster_ids,
+                cluster_index
+            )
+
+            try:
+                frame = closest_centerline_frame(
+                    centerline,
+                    centerline_locator,
+                    summary["centroid"]
+                )
+            except Exception as exc:
+                print(
+                    "    SKIPPING bad cluster {}: could not find a valid "
+                    "centerline frame: {}"
+                    .format(cluster_index, exc)
+                )
+                continue
+
+            plan = make_quality_box_plan(
+                summary,
+                frame
+            )
+
+            plans.append(plan)
+
+            print("")
+            print("Bad cluster {}".format(cluster_index))
+            print("    Bad cells:", summary["num_cells"])
+            print("    Max Quality:", summary["max_quality"])
+            print("    Cluster centroid:", summary["centroid"])
+            print("    Nearest centerline point:", frame["center"])
+            print("    Distance to centerline:", frame["distance_to_centerline"])
+            print("    Local Radius:", frame["radius"])
+            print("    Centerline tangent:", frame["tangent"])
+
+        plans = merge_nearby_quality_box_plans(plans)
+
+        print("")
+        print("Quality clip boxes after merging:", len(plans))
+
+        for box_local_index, plan in enumerate(plans):
+
+            before_cells = working.GetNumberOfCells()
+
+            debug_box = make_debug_box_polydata(
+                plan,
+                len(all_debug_boxes)
+            )
+            all_debug_boxes.append(debug_box)
+
+            print("")
+            print(
+                "Quality box {}/{}"
+                .format(box_local_index + 1, len(plans))
+            )
+            print("    Center:", plan["center"])
+            print("    Local Radius:", plan["radius"])
+            print("    Radial half-width:", plan["radial_half_width"])
+            print("    Axial half-length:", plan["axial_half_length"])
+            print("    Merged bad clusters:", plan.get("merged_cluster_ids", []))
+
+            clipped = clip_out_quality_box(
+                working,
+                plan
+            )
+
+            # This is the important topology step: a box spanning the complete
+            # local vessel section disconnects the distal spike/branch. Keep
+            # only what remains attached to the pulmonary-artery inlet.
+            clipped = keep_inlet_connected_region(
+                clipped,
+                inlet_xyz
+            )
+
+            clipped = triangulate_polydata(clipped)
+
+            working = clipped
+
+            print("    Cells before box:", before_cells)
+            print("    Cells after box/connectivity:", working.GetNumberOfCells())
+
+    final_quality_surface = compute_mesh_quality(working)
+    remaining_bad_ids = find_bad_quality_cell_ids(final_quality_surface)
+
+    remaining_bad_debug = extract_bad_quality_debug_surface(
+        final_quality_surface,
+        remaining_bad_ids
+    )
+
+    if len(all_debug_boxes) > 0:
+        boxes_debug = append_polydata_list(
+            all_debug_boxes,
+            clean_result=False
+        )
+    else:
+        boxes_debug = vtk.vtkPolyData()
+
+    print("")
+    print("Remaining Quality > threshold cells:", len(remaining_bad_ids))
+
+    return (
+        working,
+        first_bad_debug,
+        boxes_debug,
+        remaining_bad_debug,
+        len(remaining_bad_ids)
+    )
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -3227,6 +4053,10 @@ print(OUTPUT_OPEN_FILE)
 # refined open surface.
 # ============================================================
 
+# Default quality-cleanup input is the final open surface.  If a capped
+# surface is created below, this variable is replaced by the capped model.
+quality_cleanup_input = final_open
+
 if WRITE_CAPPED_OUTPUT:
 
     next_face_id = get_next_model_face_id(
@@ -3315,6 +4145,101 @@ if WRITE_CAPPED_OUTPUT:
     )
     print(OUTPUT_CAPPED_FILE)
 
+    if MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE:
+        quality_cleanup_input = final_capped_with_normals
+
+
+# ============================================================
+# FINAL MESH-QUALITY / SPIKE CLEANUP
+# ============================================================
+
+if ENABLE_MESH_QUALITY_CLEANUP:
+
+    (
+        final_quality_cleaned,
+        bad_quality_debug,
+        quality_boxes_debug,
+        remaining_bad_quality_debug,
+        remaining_bad_quality_count
+    ) = run_mesh_quality_spike_cleanup(
+        quality_cleanup_input,
+        trimmed_centerline,
+        inlet_xyz
+    )
+
+    # Recompute normals after box clipping.  The quality-cleaned result is
+    # intentionally left OPEN where a box severed a bad terminal/spike region.
+    quality_normals = vtk.vtkPolyDataNormals()
+    quality_normals.SetInputData(final_quality_cleaned)
+    quality_normals.ConsistencyOn()
+    quality_normals.SplittingOff()
+    quality_normals.ComputePointNormalsOn()
+    quality_normals.ComputeCellNormalsOn()
+    quality_normals.Update()
+
+    final_quality_cleaned_with_normals = vtk.vtkPolyData()
+    final_quality_cleaned_with_normals.DeepCopy(
+        quality_normals.GetOutput()
+    )
+
+    if REGENERATE_GLOBAL_IDS:
+        regenerate_global_ids(
+            final_quality_cleaned_with_normals
+        )
+
+    write_polydata(
+        final_quality_cleaned_with_normals,
+        OUTPUT_QUALITY_CLEANED_FILE
+    )
+
+    if (
+        bad_quality_debug is not None
+        and bad_quality_debug.GetNumberOfCells() > 0
+    ):
+        write_polydata(
+            bad_quality_debug,
+            BAD_QUALITY_CELLS_DEBUG_FILE
+        )
+        print("")
+        print("Initial bad-quality cells debug file:")
+        print(BAD_QUALITY_CELLS_DEBUG_FILE)
+
+    if quality_boxes_debug.GetNumberOfCells() > 0:
+        write_polydata(
+            quality_boxes_debug,
+            QUALITY_BOXES_DEBUG_FILE
+        )
+        print("")
+        print("Quality cleanup boxes debug file:")
+        print(QUALITY_BOXES_DEBUG_FILE)
+
+    if remaining_bad_quality_debug.GetNumberOfCells() > 0:
+        write_polydata(
+            remaining_bad_quality_debug,
+            REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE
+        )
+        print("")
+        print("Remaining bad-quality cells debug file:")
+        print(REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE)
+
+    print("")
+    print("============================================")
+    print("QUALITY-CLEANED OPEN OUTPUT")
+    print("============================================")
+    print(
+        "Points:",
+        final_quality_cleaned_with_normals.GetNumberOfPoints()
+    )
+    print(
+        "Cells:",
+        final_quality_cleaned_with_normals.GetNumberOfCells()
+    )
+    print(
+        "Remaining cells above quality threshold:",
+        remaining_bad_quality_count
+    )
+    print(OUTPUT_QUALITY_CLEANED_FILE)
+
 
 print("")
 print("============================================")
@@ -3332,5 +4257,7 @@ print("============================================")
 print("")
 print(
     "Recommended QC order: CUTS_DEBUG_FILE -> "
-    "CUT_LOOPS_DEBUG_FILE -> OUTPUT_OPEN_FILE -> OUTPUT_CAPPED_FILE"
+    "CUT_LOOPS_DEBUG_FILE -> OUTPUT_OPEN_FILE -> OUTPUT_CAPPED_FILE -> "
+    "BAD_QUALITY_CELLS_DEBUG_FILE -> QUALITY_BOXES_DEBUG_FILE -> "
+    "OUTPUT_QUALITY_CLEANED_FILE"
 )
