@@ -63,10 +63,33 @@ CUT_RADIUS_FACTOR = 1.35
 #        removed centerline branch
 SIDE_BRANCH_OFFSET_FRACTION = 0.35
 
-# If the retained centerline terminates at a junction, make one transverse
-# cut using the last retained branch direction. Positive values move the
-# plane slightly upstream into the retained parent branch.
+# If the retained centerline terminates at a pruning junction, make one
+# transverse cut using the last retained branch direction. Positive values
+# move the plane slightly upstream into the retained parent branch.
+#
+# This applies ONLY to the synthetic pruning-terminal cuts created by
+# comparing the full centerline with the trimmed centerline.
 TERMINAL_OFFSET_FRACTION = 0.0
+
+# Separate offset for the TRUE IsOutlet points on the trimmed centerline.
+# The IsOutlet point is the terminal centerline point, and the cutting-plane
+# normal is defined by the vector from the immediately upstream point toward
+# that IsOutlet point.
+#
+# 0.0 = plane exactly through the IsOutlet point
+# 0.5 = halfway from the IsOutlet point back toward the previous point
+# 1.0 = through the immediately previous centerline point
+#
+# A modest positive value is usually preferable because it removes the old
+# distal tip/cap and leaves a real vessel cross-section for the exact VTK cut.
+OUTLET_OFFSET_FRACTION = 0.50
+
+# For IsOutlet cuts only: after vtkCutter finds the closest plane/surface
+# contour, require that contour to be reasonably local to the centerline
+# endpoint. This prevents an outlet that was already removed by the pruning
+# stage from accidentally selecting a distant vessel crossed by the same
+# infinite plane. If no local contour exists, that IsOutlet is simply skipped.
+OUTLET_LOCAL_SEARCH_FACTOR = 2.5
 
 # Coordinate tolerance used to group coincident centerline endpoints that
 # use different VTK point IDs at the same anatomical bifurcation.
@@ -631,6 +654,159 @@ def build_cut_definitions(full_centerline, retained_cell_ids):
 
 
 # ============================================================
+# BUILD CUT DEFINITIONS FOR TRUE IsOutlet POINTS
+#
+# These are separate from the synthetic pruning-terminal cuts above.
+# Every IsOutlet == 1 point in the TRIMMED centerline is treated as a
+# desired final surface outlet. The plane normal points from the immediately
+# upstream centerline point toward the IsOutlet point, and the plane can be
+# shifted upstream independently with OUTLET_OFFSET_FRACTION.
+# ============================================================
+
+def build_outlet_cut_definitions(trimmed_centerline):
+
+    pd = trimmed_centerline.GetPointData()
+
+    is_outlet = pd.GetArray("IsOutlet")
+
+    if is_outlet is None:
+        raise RuntimeError(
+            "Trimmed centerline is missing PointData array 'IsOutlet'."
+        )
+
+    radius_array = pd.GetArray(RADIUS_ARRAY)
+
+    if radius_array is None:
+        raise RuntimeError(
+            "Trimmed centerline is missing PointData array "
+            "'{}'.".format(RADIUS_ARRAY)
+        )
+
+    cuts = []
+    skipped_topology = 0
+
+    for outlet_id in range(trimmed_centerline.GetNumberOfPoints()):
+
+        if int(round(is_outlet.GetTuple1(outlet_id))) != 1:
+            continue
+
+        # Find a polyline cell for which this IsOutlet point is a true
+        # endpoint. That lets us identify the immediately upstream point
+        # without making assumptions about cell orientation.
+        cell_ids = vtk.vtkIdList()
+        trimmed_centerline.GetPointCells(outlet_id, cell_ids)
+
+        endpoint_candidates = []
+
+        for j in range(cell_ids.GetNumberOfIds()):
+
+            cell_id = int(cell_ids.GetId(j))
+            cell = trimmed_centerline.GetCell(cell_id)
+
+            n = cell.GetNumberOfPoints()
+
+            if n < 2:
+                continue
+
+            first_id = int(cell.GetPointId(0))
+            last_id = int(cell.GetPointId(n - 1))
+
+            if outlet_id == first_id:
+                interior_id = int(cell.GetPointId(1))
+                endpoint_candidates.append((cell_id, interior_id))
+
+            elif outlet_id == last_id:
+                interior_id = int(cell.GetPointId(n - 2))
+                endpoint_candidates.append((cell_id, interior_id))
+
+        if len(endpoint_candidates) == 0:
+            print(
+                "WARNING: IsOutlet point {} is not an endpoint of any "
+                "polyline cell. Skipping it.".format(outlet_id)
+            )
+            skipped_topology += 1
+            continue
+
+        if len(endpoint_candidates) > 1:
+            print(
+                "WARNING: IsOutlet point {} belongs to {} endpoint cells. "
+                "Using the first one.".format(
+                    outlet_id,
+                    len(endpoint_candidates)
+                )
+            )
+
+        source_cell_id, interior_id = endpoint_candidates[0]
+
+        outlet = point_tuple(
+            trimmed_centerline,
+            outlet_id
+        )
+
+        interior = point_tuple(
+            trimmed_centerline,
+            interior_id
+        )
+
+        # Outward/downstream direction of the final centerline segment.
+        normal = normalize(
+            vec_sub(outlet, interior)
+        )
+
+        # Positive OUTLET_OFFSET_FRACTION moves the plane upstream, away
+        # from the old terminal tip/cap and into the vessel lumen.
+        cut_center = vec_add(
+            outlet,
+            vec_scale(
+                vec_sub(interior, outlet),
+                OUTLET_OFFSET_FRACTION
+            )
+        )
+
+        r0 = float(
+            radius_array.GetTuple1(outlet_id)
+        )
+
+        r1 = float(
+            radius_array.GetTuple1(interior_id)
+        )
+
+        valid_radii = [
+            r for r in (r0, r1)
+            if math.isfinite(r) and r > 0.0
+        ]
+
+        if len(valid_radii) == 0:
+            print(
+                "WARNING: IsOutlet point {} has no valid local Radius. "
+                "Skipping it.".format(outlet_id)
+            )
+            skipped_topology += 1
+            continue
+
+        # The radius is only used for QC/locality checks. Using the larger
+        # of the endpoint and immediately-upstream values is deliberately
+        # conservative, especially where Radius collapses near an old cap.
+        radius = max(valid_radii)
+
+        cuts.append(
+            {
+                "type": "outlet",
+                "center": cut_center,
+                "junction": outlet,
+                "normal": normal,
+                "radius": radius,
+                "cut_radius": radius * CUT_RADIUS_FACTOR,
+                "source_cell_id": source_cell_id,
+                "source_point_id": outlet_id,
+                "removed_cell_ids": []
+            }
+        )
+
+    return cuts, skipped_topology
+
+
+# ============================================================
 # DEBUG CIRCLES FOR THE INTENDED CUT PLANES
 # ============================================================
 
@@ -721,8 +897,11 @@ def write_cut_debug_file(cuts, filename):
 
         if cut["type"] == "side_branch":
             cut_type.InsertNextValue(1)
-        else:
+        elif cut["type"] == "terminal":
             cut_type.InsertNextValue(2)
+        else:
+            # 3 = true IsOutlet cut from the trimmed centerline
+            cut_type.InsertNextValue(3)
 
         source_cell.InsertNextValue(
             int(cut["source_cell_id"])
@@ -751,6 +930,10 @@ def write_cut_debug_file(cuts, filename):
 # the contour nearest the centerline cut point.
 # ============================================================
 
+class NoCutLoopFound(RuntimeError):
+    pass
+
+
 def find_target_cut_loop(surface, cut):
 
     plane = vtk.vtkPlane()
@@ -769,7 +952,7 @@ def find_target_cut_loop(surface, cut):
         cut_all.GetNumberOfPoints() == 0
         or cut_all.GetNumberOfCells() == 0
     ):
-        raise RuntimeError(
+        raise NoCutLoopFound(
             "Cut plane did not intersect the surface."
         )
 
@@ -797,7 +980,7 @@ def find_target_cut_loop(surface, cut):
         loop.GetNumberOfPoints() < 3
         or loop.GetNumberOfCells() == 0
     ):
-        raise RuntimeError(
+        raise NoCutLoopFound(
             "Could not isolate a valid cut contour near the centerline."
         )
 
@@ -846,6 +1029,27 @@ def find_target_cut_loop(surface, cut):
         if cut["cut_radius"] > 0.0
         else float("inf")
     )
+
+    # For true IsOutlet cuts, an already-pruned branch can leave no local
+    # surface at the requested endpoint even though the infinite plane may
+    # intersect some other distant vessel. Treat that situation as
+    # "no local cross-section" so the outlet can be skipped safely.
+    if cut.get("type") == "outlet":
+
+        local_limit = (
+            cut["cut_radius"]
+            * OUTLET_LOCAL_SEARCH_FACTOR
+        )
+
+        if (
+            min_radial is None
+            or min_radial > local_limit
+        ):
+            raise NoCutLoopFound(
+                "No local vessel cross-section was found near this "
+                "IsOutlet point. The nearest plane contour was too far "
+                "from the outlet centerline location."
+            )
 
     if ratio > MAX_LOOP_TO_EXPECTED_RADIUS_RATIO:
 
@@ -1385,7 +1589,12 @@ def annotate_loop(loop, cut_index, cut):
     source_cell_array.SetName("SourceCellId")
     source_cell_array.SetNumberOfTuples(out.GetNumberOfCells())
 
-    type_value = 1 if cut["type"] == "side_branch" else 2
+    if cut["type"] == "side_branch":
+        type_value = 1
+    elif cut["type"] == "terminal":
+        type_value = 2
+    else:
+        type_value = 3
 
     for i in range(out.GetNumberOfCells()):
         cut_index_array.SetTuple1(i, cut_index)
@@ -1671,49 +1880,66 @@ print(
 # CUT DEFINITIONS
 # ============================================================
 
-cuts, boundary_junction_count = build_cut_definitions(
+# Stage 1: cuts inferred from branches removed between the full and trimmed
+# centerline trees. These include side-branch pruning cuts and synthetic
+# pruning-terminal cuts.
+pruning_cuts, boundary_junction_count = build_cut_definitions(
     full_centerline,
     retained_cell_ids
 )
 
 side_cut_count = sum(
-    1 for cut in cuts
+    1 for cut in pruning_cuts
     if cut["type"] == "side_branch"
 )
 
 terminal_cut_count = sum(
-    1 for cut in cuts
+    1 for cut in pruning_cuts
     if cut["type"] == "terminal"
 )
 
+# Stage 2: true IsOutlet cuts from the trimmed centerline. These are applied
+# AFTER the pruning stage has removed disconnected distal branches.
+outlet_cuts, outlet_topology_skips = build_outlet_cut_definitions(
+    trimmed_centerline
+)
+
+all_planned_cuts = pruning_cuts + outlet_cuts
+
 print("")
 print("============================================")
-print("Pruning boundary summary")
+print("Cut planning summary")
 print("============================================")
-print("Boundary junctions:", boundary_junction_count)
-print("Side-branch cuts:", side_cut_count)
-print("Terminal cuts:", terminal_cut_count)
-print("Total surface cuts:", len(cuts))
+print("Pruning boundary junctions:", boundary_junction_count)
+print("Side-branch pruning cuts:", side_cut_count)
+print("Synthetic pruning-terminal cuts:", terminal_cut_count)
+print("Trimmed-centerline IsOutlet cuts planned:", len(outlet_cuts))
+print("IsOutlet points skipped for centerline topology/radius:", outlet_topology_skips)
+print("Total planned surface cuts:", len(all_planned_cuts))
 
-if len(cuts) == 0:
+if len(all_planned_cuts) == 0:
     raise RuntimeError(
-        "No retained/removed centerline boundaries were found."
+        "No pruning-boundary cuts or IsOutlet cuts were found."
     )
 
-for i, cut in enumerate(cuts):
+for i, cut in enumerate(all_planned_cuts):
 
     print("")
-    print("Cut {} / {}".format(i + 1, len(cuts)))
+    print("Planned cut {} / {}".format(i + 1, len(all_planned_cuts)))
     print("    Type:", cut["type"])
     print("    Center:", cut["center"])
     print("    Normal:", cut["normal"])
     print("    Centerline radius:", cut["radius"])
     print("    Expected QC radius:", cut["cut_radius"])
-    print("    Source full-tree cell:", cut["source_cell_id"])
-    print("    Removed cell(s):", cut["removed_cell_ids"])
+    print("    Source centerline cell:", cut["source_cell_id"])
+
+    if cut["type"] == "outlet":
+        print("    IsOutlet point ID:", cut["source_point_id"])
+    else:
+        print("    Removed cell(s):", cut["removed_cell_ids"])
 
 write_cut_debug_file(
-    cuts,
+    all_planned_cuts,
     CUTS_DEBUG_FILE
 )
 
@@ -1778,26 +2004,35 @@ print("Triangulated surface cells:", working_surface.GetNumberOfCells())
 
 
 # ============================================================
-# APPLY EACH EXACT LOCAL PLANE CUT
+# APPLY EXACT LOCAL PLANE CUTS
+#
+# Stage 1: apply all full-vs-trimmed pruning cuts. These are required and
+# remain fatal if they fail.
+#
+# Stage 2: first discard the distal pieces disconnected by Stage 1, then
+# process every true IsOutlet point from the trimmed centerline. If an
+# IsOutlet no longer has a LOCAL cross-section, it is skipped because the
+# earlier pruning-terminal logic already removed that branch.
 # ============================================================
 
 selected_loops = []
 flat_caps = []
 successful_cut_indices = []
+skipped_outlet_cut_indices = []
 
 print("")
 print("============================================")
-print("Applying exact VTK plane cuts")
+print("STAGE 1: Applying pruning-boundary VTK cuts")
 print("============================================")
 
-for cut_index, cut in enumerate(cuts):
+for cut_index, cut in enumerate(pruning_cuts):
 
     print("")
     print(
-        "Exact cut {}/{} ({})"
+        "Pruning cut {}/{} ({})"
         .format(
             cut_index + 1,
-            len(cuts),
+            len(pruning_cuts),
             cut["type"]
         )
     )
@@ -1830,22 +2065,13 @@ for cut_index, cut in enumerate(cuts):
             cut_index
         )
 
-        print(
-            "    Target loop points:",
-            stats["num_loop_points"]
-        )
-        print(
-            "    Source triangles intersected:",
-            stats["num_crossing_cells"]
-        )
+        print("    Target loop points:", stats["num_loop_points"])
+        print("    Source triangles intersected:", stats["num_crossing_cells"])
         print(
             "    Downstream sacrificial one-ring triangles removed:",
             stats["num_downstream_neighbor_cells_removed"]
         )
-        print(
-            "    Loop max radial distance:",
-            stats["max_radial"]
-        )
+        print("    Loop max radial distance:", stats["max_radial"])
         print(
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
@@ -1857,17 +2083,147 @@ for cut_index, cut in enumerate(cuts):
 
     except Exception as exc:
 
-        # For this refinement stage, stop rather than silently producing a
-        # partially pruned model. The debug cut circles tell you which plane
-        # needs adjustment.
         raise RuntimeError(
-            "Exact cut {} ({}) failed:\n{}"
+            "Pruning cut {} ({}) failed:\n{}"
             .format(
                 cut_index,
                 cut["type"],
                 exc
             )
         )
+
+
+# ============================================================
+# REMOVE DISTAL PIECES CREATED BY THE PRUNING CUTS
+#
+# This intermediate connectivity pass is deliberate. It ensures that an
+# IsOutlet lying on a branch already removed in Stage 1 no longer has a local
+# surface cross-section available when Stage 2 tries to process it.
+# ============================================================
+
+if len(pruning_cuts) > 0:
+
+    working_surface = keep_inlet_connected_region(
+        working_surface,
+        inlet_xyz
+    )
+
+    working_surface = triangulate_polydata(
+        working_surface
+    )
+
+    print("")
+    print(
+        "Surface cells after Stage-1 inlet-connectivity cleanup:",
+        working_surface.GetNumberOfCells()
+    )
+
+
+# ============================================================
+# STAGE 2: TRUE IsOutlet CUTS
+# ============================================================
+
+print("")
+print("============================================")
+print("STAGE 2: Applying trimmed IsOutlet VTK cuts")
+print("============================================")
+
+outlet_success_count = 0
+outlet_skip_count = 0
+
+for outlet_local_index, cut in enumerate(outlet_cuts):
+
+    cut_index = (
+        len(pruning_cuts)
+        + outlet_local_index
+    )
+
+    print("")
+    print(
+        "IsOutlet cut {}/{} (point {})"
+        .format(
+            outlet_local_index + 1,
+            len(outlet_cuts),
+            cut["source_point_id"]
+        )
+    )
+
+    try:
+
+        (
+            working_surface,
+            loop,
+            cap,
+            stats
+        ) = apply_exact_local_plane_cut(
+            working_surface,
+            cut
+        )
+
+        selected_loops.append(
+            annotate_loop(
+                loop,
+                cut_index,
+                cut
+            )
+        )
+
+        flat_caps.append(
+            (cut_index, cut, cap)
+        )
+
+        successful_cut_indices.append(
+            cut_index
+        )
+
+        outlet_success_count += 1
+
+        print("    Target loop points:", stats["num_loop_points"])
+        print("    Source triangles intersected:", stats["num_crossing_cells"])
+        print(
+            "    Downstream sacrificial one-ring triangles removed:",
+            stats["num_downstream_neighbor_cells_removed"]
+        )
+        print("    Loop max radial distance:", stats["max_radial"])
+        print(
+            "    Loop centroid offset from centerline:",
+            stats["centroid_offset"]
+        )
+        print(
+            "    Working surface cells after cut:",
+            working_surface.GetNumberOfCells()
+        )
+
+    except NoCutLoopFound as exc:
+
+        outlet_skip_count += 1
+        skipped_outlet_cut_indices.append(
+            cut_index
+        )
+
+        print(
+            "    SKIPPED: no local cross-section was found. "
+            "This outlet was likely removed by the preceding "
+            "pruning-terminal stage."
+        )
+        print("    Reason:", exc)
+
+    except Exception as exc:
+
+        # A genuinely geometric/VTK failure is still treated as an error.
+        # Only absence of a local cross-section is silently skippable.
+        raise RuntimeError(
+            "IsOutlet cut {} (point {}) failed:\n{}"
+            .format(
+                outlet_local_index,
+                cut["source_point_id"],
+                exc
+            )
+        )
+
+print("")
+print("IsOutlet cuts completed:", outlet_success_count)
+print("IsOutlet cuts skipped (no local cross-section):", outlet_skip_count)
 
 
 # ============================================================
@@ -1890,11 +2246,13 @@ print(CUT_LOOPS_DEBUG_FILE)
 
 
 # ============================================================
-# WRITE PRE-CONNECTIVITY EXACT-CUT SURFACE
+# WRITE PRE-FINAL-CONNECTIVITY EXACT-CUT SURFACE
 #
-# This still contains the detached distal vessel pieces. The difference
-# from the old script is that the cut boundaries now contain interpolated
-# plane-intersection points rather than whole missing triangles.
+# Stage-1 pruning distal pieces have already been removed before the IsOutlet
+# stage. This debug surface can still contain the short distal stumps created
+# by the new IsOutlet cuts, which the final connectivity pass removes below.
+# The cut boundaries use interpolated plane-intersection points rather than
+# whole missing triangles.
 # ============================================================
 
 write_polydata(
@@ -2050,6 +2408,15 @@ if WRITE_CAPPED_OUTPUT:
     )
     print(OUTPUT_CAPPED_FILE)
 
+
+print("")
+print("============================================")
+print("CUT SUMMARY")
+print("============================================")
+print("Pruning cuts completed:", len(pruning_cuts))
+print("IsOutlet cuts planned:", len(outlet_cuts))
+print("IsOutlet cuts completed:", outlet_success_count)
+print("IsOutlet cuts skipped:", outlet_skip_count)
 
 print("")
 print("============================================")
