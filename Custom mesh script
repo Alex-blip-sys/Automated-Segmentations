@@ -6,8 +6,9 @@ End-to-end utility for:
 
 1) transferring SimVascular ModelFaceID labels from an existing reference
    model onto a new CLOSED pulmonary-artery surface,
-2) tetrahedralizing that surface with Gmsh, and
-3) exporting a SimVascular-compatible mesh-complete directory.
+2) diagnosing degenerate/sliver/duplicate/self-intersecting surface patches,
+3) tetrahedralizing that surface with Gmsh, and
+4) exporting a SimVascular-compatible mesh-complete directory.
 
 Expected inputs
 ---------------
@@ -42,7 +43,8 @@ The mesh-complete files include the SimVascular arrays:
 
 Dependencies
 ------------
-    pip install numpy pyvista vtk gmsh
+    pip install numpy pyvista vtk gmsh scipy
+    (scipy is optional for diagnostics clustering, but recommended)
 
 Notes
 -----
@@ -62,6 +64,8 @@ Notes
 
 from __future__ import annotations
 
+import csv
+import json
 import math
 import os
 import re
@@ -78,17 +82,16 @@ import pyvista as pv
 # USER SETTINGS
 # ============================================================================
 
-BASE_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp"
-OLD_FACENAMES = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp.facenames"
-# Can be .vtp, .stl, or another PyVista-readable polygonal surface.
-RESULT_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result.vtp"
+BASE_VTP = "/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_gen4_Trimmed_and_subtracted.vtp"
+OLD_FACENAMES = "/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_gen4_Trimmed_and_subtracted.vtp.facenames"
+RESULT_VTP = "/home/cgrladmin/Simvascular/JL_Gen4_RepairTesting/JL_gen4_Trimmed_and_subtracted.vtp"
 
 # Labelled surface written for QC before Gmsh is called.
-OUTPUT_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result_assigned.vtp"
+OUTPUT_VTP = "/home/cgrladmin/Simvascular/SV_MP_Modeler/Models/JL_gen4_assigned.vtp"
 OUTPUT_FACENAMES = OUTPUT_VTP + ".facenames"
 
 # Final SimVascular-ready directory.
-MESH_COMPLETE_DIR = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result-gmsh-mesh-complete"
+MESH_COMPLETE_DIR = "/home/cgrladmin/Simvascular/SV_MP_Modeler/Models/JL_gen4-gmsh-mesh-complete"
 
 # Optional Gmsh .msh file retained for independent QC in Gmsh/ParaView.
 KEEP_GMSH_MSH = True
@@ -108,7 +111,7 @@ CAP_PERCENTILE = 95
 
 # Thickness of the cap-plane envelope used ONLY for assigning ModelFaceID to
 # RESULT_VTP before meshing.  Increase if a known planar cap gets zero cells.
-PLANE_TOL_FACTOR = 0.00005
+PLANE_TOL_FACTOR = 0.001
 
 # Small enlargement of the radial cap envelope during initial face assignment.
 CAP_RADIUS_ASSIGNMENT_FACTOR = 1.02
@@ -178,6 +181,50 @@ REQUIRE_SINGLE_CONNECTED_COMPONENT = True
 REQUIRE_WATERTIGHT_SURFACE = True
 REQUIRE_MANIFOLD_SURFACE = True
 
+
+
+# ============================================================================
+# ADVANCED SURFACE-FAILURE DIAGNOSTICS
+# ============================================================================
+# Diagnostics run on the labelled result before Gmsh (including when meshing
+# fails). All positions use the input model's native coordinate system/units.
+DIAGNOSTICS_ENABLED = True
+DIAGNOSTICS_ONLY = False          # True = check/write reports; do NOT call Gmsh
+DIAGNOSTICS_FOLDER = "surface_diagnostics"
+
+# Geometric risk thresholds. These are indicators, not proof of a Gmsh error.
+DIAG_MIN_TRIANGLE_QUALITY = 0.025      # 1=equilateral, 0=degenerate
+DIAG_CAP_MIN_TRIANGLE_QUALITY = 0.07   # stricter on planar cap triangles
+DIAG_MAX_EDGE_RATIO = 35.0
+DIAG_CAP_MAX_EDGE_RATIO = 16.0
+DIAG_TINY_AREA_VS_MEDIAN = 1.0e-5
+DIAG_DEGENERATE_AREA_BBOX_FACTOR = 1.0e-15
+DIAG_CHECK_DUPLICATE_TRIANGLES = True
+
+# Non-adjacent triangle-triangle intersections: expensive on multi-million
+# triangle surfaces. 'targeted' scans suspect-quality triangles and a spatially
+# distributed sample of caps and wall. 'full' scans every triangle but can be
+# very slow. Both use VTK spatial indexing and the same exact intersection test.
+# 'off' disables intersection checking.
+DIAG_INTERSECTION_SCAN_MODE = "targeted"  # off | targeted | full
+DIAG_MAX_INTERSECTION_SEEDS = 50000        # targeted mode only
+DIAG_MAX_PAIR_TESTS = 500000               # upper bound in BOTH modes
+DIAG_MAX_CONFIRMED_PAIRS = 3000
+DIAG_INTERSECTION_EPS_BBOX_FRACTION = 1.0e-10
+
+# Limit memory/output on very large surfaces; counts in report remain exact.
+DIAG_MAX_MARKED_TRIANGLES = 120000
+DIAG_CLUSTER_RADIUS_MEDIAN_EDGE_FACTOR = 5.0
+DIAG_CLUSTER_RADIUS_BBOX_FACTOR = 0.002
+DIAG_REPORT_TOP_REGIONS = 40
+DIAG_MAX_REGION_RECORDS = 2000  # bound reporting overhead for speckled meshes
+DIAG_WRITE_TOP_REGION_PATCHES = 15
+DIAG_REGION_CONTEXT_RADIUS_FACTOR = 1.5
+DIAG_REGION_MAX_CONTEXT_TRIANGLES = 100000
+
+# When True, abort before Gmsh if an actual non-adjacent triangle intersection
+# was found. Default False so diagnostics can be used while meshing as before.
+DIAG_ABORT_ON_CONFIRMED_INTERSECTIONS = False
 
 # ============================================================================
 # BASIC I/O
@@ -439,6 +486,616 @@ def validate_closed_surface(surface: pv.PolyData) -> None:
                 f"RESULT_VTP has {n_regions} disconnected surface regions. "
                 "Expected exactly one connected PA lumen surface."
             )
+
+
+
+# ============================================================================
+# ADVANCED GEOMETRY DIAGNOSTICS (before Gmsh)
+# ============================================================================
+# Flags are stored as a bitmask in ProblemFlags on suspect_triangles.vtp:
+#    1 degenerate, 2 tiny, 4 poor quality, 8 long/short edge ratio,
+#   16 duplicate triangle, 32 confirmed self-intersection.
+# The saved diagnostics are hypotheses/confirmed local defects, not a Gmsh
+# PLC-error coordinate; Gmsh does not report the offending triangle here.
+
+_DFLAG_NAMES = {
+    1: "degenerate", 2: "tiny_area", 4: "poor_shape",
+    8: "skinny_edges", 16: "duplicate_triangle", 32: "self_intersection",
+}
+
+
+def _diag_flag_text(mask):
+    return ",".join(n for b, n in _DFLAG_NAMES.items() if int(mask) & b) or "none"
+
+
+def _diag_json_native(v):
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, Path):
+        return str(v)
+    raise TypeError(type(v).__name__)
+
+
+def _diag_caps_near_position(xyz, cap_descriptors, max_axial_radii=2.5,
+                             max_radial_radii=1.8):
+    """Reference-plane proximity fallback for triangles currently named wall."""
+    p = np.asarray(xyz, dtype=float)
+    best = None
+    for cap in cap_descriptors:
+        r = max(float(cap['radius']), 1e-12)
+        v = p - cap['centroid']
+        axial = abs(float(np.dot(v, cap['normal']))) / r
+        radial = float(np.linalg.norm(v - np.dot(v, cap['normal']) * cap['normal'])) / r
+        if axial <= max_axial_radii and radial <= max_radial_radii:
+            score = axial + 0.3 * radial
+            if best is None or score < best[0]:
+                best = (score, cap['name'], int(cap['fid']), axial, radial)
+    return best
+
+
+def _diag_select_seeds(flags, face_ids, wall_fid, quality, n):
+    """Prioritize confirmed-risk facets, then sample caps/wall spatially."""
+    if DIAG_INTERSECTION_SCAN_MODE.lower() == 'full':
+        return np.arange(n, dtype=np.int64)
+    if DIAG_INTERSECTION_SCAN_MODE.lower() == 'off':
+        return np.empty(0, dtype=np.int64)
+    cap = np.flatnonzero(face_ids != wall_fid)
+    risky = np.flatnonzero(flags != 0)
+    # Lowest quality first, but ensure geographic coverage via regular strides.
+    risky_worst = risky[np.argsort(quality[risky])] if len(risky) else risky
+    budget = max(100, int(DIAG_MAX_INTERSECTION_SEEDS))
+    selected = []
+    for arr, quota in (
+        (risky_worst, int(budget * .55)),
+        (cap, int(budget * .35)),
+        (np.arange(n, dtype=np.int64), budget),
+    ):
+        if len(selected) >= budget:
+            break
+        count = min(len(arr), quota, budget - len(selected))
+        if count == 0:
+            continue
+        if arr is risky_worst:
+            sub = arr[:count]
+        else:
+            sub = arr[np.linspace(0, len(arr)-1, count, dtype=np.int64)]
+        selected.extend(sub.tolist())
+    # Preserve the severity-first ordering: np.unique() would silently sort
+    # by VTK cell ID and make the pair-test budget bias toward low IDs.
+    return np.fromiter(dict.fromkeys(selected), dtype=np.int64)
+
+
+def _diag_tritri_pairs(surface, vertices, faces, seed_ids):
+    """Broad phase via vtkStaticCellLocator, narrow via vtkTriangle.
+
+    Skips triangles sharing any vertex: those are nominal neighbors, and
+    overlapping-neighbor issues require other tests. Coplanar coincidences
+    are additionally screened via duplicate-face detection.
+    """
+    import vtk
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(surface)
+    locator.BuildLocator()
+    trial = vtk.vtkIdList()
+    tri_test = vtk.vtkTriangle()
+    confirmed = []
+    candidate_queries = 0
+    pair_tests = 0
+    seen = set()
+    eps = max(float(np.linalg.norm(vertices.max(axis=0)-vertices.min(axis=0))) *
+              DIAG_INTERSECTION_EPS_BBOX_FRACTION, 1e-12)
+    budget = int(DIAG_MAX_PAIR_TESTS)
+    complete = True
+    for seed_index, i in enumerate(seed_ids):
+        i = int(i)
+        pp = vertices[faces[i]]
+        bbox = (float(pp[:,0].min()-eps),float(pp[:,0].max()+eps),
+                float(pp[:,1].min()-eps),float(pp[:,1].max()+eps),
+                float(pp[:,2].min()-eps),float(pp[:,2].max()+eps))
+        trial.Reset()
+        locator.FindCellsWithinBounds(bbox, trial)
+        candidate_queries += 1
+        aa = set(faces[i].tolist())
+        for jj in range(trial.GetNumberOfIds()):
+            j = int(trial.GetId(jj))
+            if i == j:
+                continue
+            pair = (min(i,j), max(i,j))
+            if pair in seen:
+                continue
+            seen.add(pair)
+            if aa.intersection(faces[j].tolist()):
+                continue
+            qq = vertices[faces[j]]
+            pair_tests += 1
+            hit = tri_test.TrianglesIntersect(
+                tuple(map(float,pp[0])), tuple(map(float,pp[1])),tuple(map(float,pp[2])),
+                tuple(map(float,qq[0])), tuple(map(float,qq[1])),tuple(map(float,qq[2])))
+            if hit:
+                confirmed.append((i,j))
+                if len(confirmed) >= DIAG_MAX_CONFIRMED_PAIRS:
+                    complete = False
+                    break
+            if pair_tests >= budget:
+                complete = False
+                break
+        if pair_tests >= budget or len(confirmed) >= DIAG_MAX_CONFIRMED_PAIRS:
+            break
+        if (seed_index+1) % 10000 == 0:
+            print(f"  Intersection scan: {seed_index+1}/{len(seed_ids)} seeds; "
+                  f"{pair_tests} triangle-pair tests; {len(confirmed)} crossings", flush=True)
+    return confirmed, {
+        'seed_triangles_examined': candidate_queries,
+        'seed_triangles_available': int(len(seed_ids)),
+        'triangle_pair_tests': pair_tests,
+        'confirmed_intersecting_pairs_found': len(confirmed),
+        'scan_complete_within_limits': bool(complete and candidate_queries == len(seed_ids)),
+        'note': ('Targeted mode is a sample, NOT an exhaustive proof of no intersections.'
+                 if DIAG_INTERSECTION_SCAN_MODE.lower() == 'targeted' else
+                 'Pairs involving shared VTK point IDs were excluded.'),
+    }
+
+
+
+def _diag_intersection_xyz(pts, fa, fb, epsilon=1e-12):
+    """Find a physical segment-plane crossing on two intersecting triangles.
+
+    Non-coplanar intersections usually return a true point on both triangles.
+    For coplanar/degenerate overlaps, return an approximate midpoint and
+    explicitly mark it as approximate in confirmed_intersections.csv.
+    """
+    aa = pts[fa]
+    bb = pts[fb]
+    found=[]
+    def segment_hits_triangle(x,y,tri):
+        e0,e1=tri[1]-tri[0],tri[2]-tri[0]
+        normal=np.cross(e0,e1)
+        nn=float(np.linalg.norm(normal))
+        if nn<epsilon:
+            return None
+        direction=y-x
+        den=float(np.dot(normal,direction))
+        if abs(den)<epsilon*nn*max(float(np.linalg.norm(direction)),1e-12):
+            return None
+        frac=float(np.dot(normal,tri[0]-x)/den)
+        if not (-1e-9<=frac<=1.0+1e-9):
+            return None
+        pt=x+min(1.0,max(0.0,frac))*direction
+        v=pt-tri[0]
+        d00=float(np.dot(e0,e0));d01=float(np.dot(e0,e1))
+        d11=float(np.dot(e1,e1));d20=float(np.dot(v,e0));d21=float(np.dot(v,e1))
+        det=d00*d11-d01*d01
+        if abs(det)<epsilon**2:
+            return None
+        u=(d11*d20-d01*d21)/det
+        w=(d00*d21-d01*d20)/det
+        if u>=-1e-7 and w>=-1e-7 and u+w<=1.0+1e-7:
+            return pt
+        return None
+    for source,dest in ((aa,bb),(bb,aa)):
+        for k in range(3):
+            p=segment_hits_triangle(source[k],source[(k+1)%3],dest)
+            if p is not None:
+                found.append(p)
+    if found:
+        return np.mean(np.asarray(found),axis=0),True
+    return .5*(np.mean(aa,axis=0)+np.mean(bb,axis=0)),False
+
+
+def _diag_components(xyz, radius):
+    """Bounded-degree kNN proximity graph, avoids quadratic radius queries."""
+    xyz = np.asarray(xyz, dtype=float)
+    n = len(xyz)
+    if n == 0:
+        return np.empty(0, dtype=np.int32)
+    if n == 1:
+        return np.zeros(1, dtype=np.int32)
+    try:
+        from scipy.spatial import cKDTree
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        k = min(9, n)
+        tree = cKDTree(xyz)
+        try:
+            d, idx = tree.query(xyz, k=k, distance_upper_bound=radius, workers=1)
+        except TypeError:
+            d, idx = tree.query(xyz, k=k, distance_upper_bound=radius)
+        if k == 1:
+            d = d.reshape(-1,1)
+            idx = idx.reshape(-1,1)
+        good = (idx < n) & (d <= radius) & (idx != np.arange(n)[:,None])
+        src = np.broadcast_to(np.arange(n)[:,None], idx.shape)[good]
+        dst = idx[good]
+        g = coo_matrix((np.ones(len(src),dtype=np.uint8),(src,dst)),shape=(n,n)).tocsr()
+        _, labels = connected_components(g, directed=False)
+        return labels.astype(np.int32)
+    except ImportError:
+        # Without SciPy: use a coarse voxel grouping; no fake adjacency claim.
+        keys = np.floor(xyz / max(radius,1e-12)).astype(np.int64)
+        _, inv = np.unique(keys, axis=0, return_inverse=True)
+        return inv.astype(np.int32)
+
+
+def _diag_export_region_context(surface, locator, vertices, faces, rec, output_dir):
+    """Write open patch for overlay/inspection, NOT a replacement closed STL."""
+    import vtk
+    center = np.asarray(rec['center_xyz'],dtype=float)
+    lo = np.asarray(rec['min_xyz'],dtype=float)
+    hi = np.asarray(rec['max_xyz'],dtype=float)
+    diameter = max(float(np.linalg.norm(hi-lo)), float(rec['cluster_radius']))
+    half = .5*(hi-lo) + DIAG_REGION_CONTEXT_RADIUS_FACTOR*diameter
+    ids = vtk.vtkIdList()
+    bounds = (float(center[0]-half[0]),float(center[0]+half[0]),
+              float(center[1]-half[1]),float(center[1]+half[1]),
+              float(center[2]-half[2]),float(center[2]+half[2]))
+    locator.FindCellsWithinBounds(bounds,ids)
+    cellids = np.asarray([ids.GetId(i) for i in range(ids.GetNumberOfIds())],dtype=np.int64)
+    if len(cellids) > DIAG_REGION_MAX_CONTEXT_TRIANGLES:
+        centroids = vertices[faces[cellids]].mean(axis=1)
+        rr = np.sum((centroids-center)**2,axis=1)
+        cellids = cellids[np.argpartition(rr, DIAG_REGION_MAX_CONTEXT_TRIANGLES-1)
+                          [:DIAG_REGION_MAX_CONTEXT_TRIANGLES]]
+    if len(cellids):
+        poly = surface.extract_cells(cellids).extract_surface()
+        name = f"region_{rec['region_id']:04d}_context"
+        poly.save(str(output_dir / (name+'.vtp')))
+        # STL is an OPEN patch and is intended as a visual guide alongside the
+        # full surface in Meshmixer/MeshLab, not a meshable standalone solid.
+        poly.save(str(output_dir / (name+'.stl')))
+        rec['context_triangles'] = int(len(cellids))
+        rec['context_file'] = name + '.vtp'
+
+
+def run_surface_diagnostics(surface, assignments, caps, wall_fid, root):
+    """Write spatial problem atlas, per-region coordinates and cap names."""
+    import vtk
+    outdir = Path(root) / DIAGNOSTICS_FOLDER
+    outdir.mkdir(parents=True, exist_ok=True)
+    for stale in outdir.glob('region_*_context.*'):
+        if stale.suffix.lower() in ('.vtp','.stl'):
+            stale.unlink()
+    for stale_name in ('suspect_triangles.vtp','problem_region_centers.vtp'):
+        stale = outdir/stale_name
+        if stale.exists():
+            stale.unlink()
+    print("\n" + "="*72 + "\nADVANCED PRE-GMSH SURFACE DIAGNOSTICS\n" + "="*72)
+    print(f"  Diagnostic directory: {outdir}", flush=True)
+    faces = np.asarray(surface.faces,dtype=np.int64).reshape(-1,4)[:,1:]
+    pts = np.asarray(surface.points,dtype=np.float64)
+    n = len(faces)
+    diag = float(np.linalg.norm(pts.max(axis=0)-pts.min(axis=0)))
+    face_ids = np.asarray(surface.cell_data['ModelFaceID'],dtype=np.int32)
+    flags = np.zeros(n,dtype=np.uint8)
+    qualities = np.empty(n,dtype=np.float32)
+    min_edges = np.empty(n,dtype=np.float32)
+    areas = np.empty(n,dtype=np.float64)
+    edge_ratios = np.empty(n,dtype=np.float32)
+    # Chunk triangle math to avoid multiplying peak memory on >2M triangles.
+    for start in range(0,n,150000):
+        end = min(start+150000,n)
+        t = pts[faces[start:end]]
+        d01 = t[:,1]-t[:,0]
+        d12 = t[:,2]-t[:,1]
+        d20 = t[:,0]-t[:,2]
+        l2 = np.stack(((d01*d01).sum(axis=1),(d12*d12).sum(axis=1),
+                       (d20*d20).sum(axis=1)),axis=1)
+        lengths = np.sqrt(l2)
+        a = .5*np.linalg.norm(np.cross(d01,-d20),axis=1)
+        q = 4.0*np.sqrt(3.0)*a / np.maximum(l2.sum(axis=1),1e-300)
+        mn = lengths.min(axis=1)
+        ratio = lengths.max(axis=1)/np.maximum(mn,1e-300)
+        areas[start:end] = a
+        qualities[start:end] = q
+        min_edges[start:end] = mn
+        edge_ratios[start:end] = ratio
+    med_area = float(np.median(areas[areas>0])) if np.any(areas>0) else 0.0
+    median_edge = float(np.median(min_edges[min_edges>0])) if np.any(min_edges>0) else 0.0
+    zero_threshold = max(diag**2 * DIAG_DEGENERATE_AREA_BBOX_FACTOR,1e-30)
+    flags[areas<=zero_threshold] |= 1
+    flags[(areas<=max(zero_threshold,med_area*DIAG_TINY_AREA_VS_MEDIAN))] |= 2
+    cap_mask = face_ids!=int(wall_fid)
+    flags[qualities < np.where(cap_mask,DIAG_CAP_MIN_TRIANGLE_QUALITY,
+                               DIAG_MIN_TRIANGLE_QUALITY)] |= 4
+    flags[edge_ratios > np.where(cap_mask,DIAG_CAP_MAX_EDGE_RATIO,
+                                 DIAG_MAX_EDGE_RATIO)] |= 8
+    if DIAG_CHECK_DUPLICATE_TRIANGLES:
+        print('  Checking coincident triangles by sorted vertex IDs...',flush=True)
+        ordered = np.sort(faces,axis=1)
+        _, inv, ct = np.unique(ordered,axis=0,return_inverse=True,
+                               return_counts=True)
+        flags[ct[inv]>1] |= 16
+        del ordered, inv, ct
+    counts = {name:int(np.count_nonzero(flags & bit))
+              for bit,name in _DFLAG_NAMES.items()}
+
+    # Export precise boundary/nonmanifold edge locations, not just counts.
+    # This is useful when 'watertight' succeeds but Gmsh sees an invalid PLC.
+    topology = {}
+    for category, kwargs in (
+        ('boundary_edges', dict(boundary_edges=True,feature_edges=False,
+                                manifold_edges=False,non_manifold_edges=False)),
+        ('nonmanifold_edges', dict(boundary_edges=False,feature_edges=False,
+                                   manifold_edges=False,non_manifold_edges=True)),
+    ):
+        edges = surface.extract_feature_edges(**kwargs)
+        topology[category] = int(edges.n_cells)
+        if edges.n_cells:
+            edges.save(str(outdir/(category+'.vtp')))
+        elif (outdir/(category+'.vtp')).exists():
+            (outdir/(category+'.vtp')).unlink()
+
+    # Summarize every cap, even those that received ZERO cells. Also test
+    # whether stamped cap triangles actually lie near the reference cap plane.
+    sorted_face_rows = np.argsort(face_ids,kind='stable')
+    sorted_face_values = face_ids[sorted_face_rows]
+    cap_records = []
+    for cap in caps:
+        fid = int(cap['fid'])
+        left = int(np.searchsorted(sorted_face_values,fid,'left'))
+        right = int(np.searchsorted(sorted_face_values,fid,'right'))
+        ids = sorted_face_rows[left:right]
+        c = np.asarray(cap['centroid'],float)
+        nn = np.asarray(cap['normal'],float)
+        rad = max(float(cap['radius']),1e-12)
+        if len(ids):
+            sampled = ids if len(ids)<=100000 else ids[np.linspace(0,len(ids)-1,100000,dtype=int)]
+            cc = pts[faces[sampled]].mean(axis=1)
+            displacement = cc-c
+            axial_r = np.abs(displacement @ nn)/rad
+            inplane_r = np.linalg.norm(displacement-(displacement@nn)[:,None]*nn,axis=1)/rad
+            max_ax = float(np.max(axial_r))
+            n_far = int(np.count_nonzero(axial_r>0.10))
+            avg_r = float(np.mean(inplane_r))
+            area_total = float(areas[ids].sum())
+            qmin = float(qualities[ids].min())
+        else:
+            max_ax = None
+            n_far = 0
+            avg_r = None
+            area_total = 0.0
+            qmin = None
+        cap_records.append({
+            'fid':fid,'cap_name':cap['name'],'cell_count':int(len(ids)),
+            'total_triangle_area':area_total,'reference_radius':rad,
+            'area_to_reference_disk_ratio':area_total/(np.pi*rad*rad),
+            'minimum_triangle_quality':qmin,
+            'max_axial_distance_in_reference_radii':max_ax,
+            'triangles_over_0p1R_from_reference_plane_in_sample':n_far,
+            'avg_normalized_radial_position_in_sample':avg_r,
+            'severe_quality_triangles':int(np.count_nonzero(flags[ids] & (1|2|4|8|16))),
+        })
+    with (outdir/'cap_quality.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.DictWriter(f,fieldnames=list(cap_records[0]) if cap_records else
+                              ['fid','cap_name','cell_count'])
+        writer.writeheader()
+        writer.writerows(cap_records)
+    missing_caps=[r['cap_name'] for r in cap_records if r['cell_count']==0]
+    if missing_caps:
+        print(f"  WARNING: {len(missing_caps)} caps received ZERO ModelFaceID triangles: "
+              f"{', '.join(missing_caps[:12])}" + (' ...' if len(missing_caps)>12 else ''))
+    print(f"  Topology: {topology['boundary_edges']} boundary edges; "
+          f"{topology['nonmanifold_edges']} nonmanifold edges")
+    print(f"  Cap-wise QC summary: {outdir/'cap_quality.csv'}")
+    print(f"  Model: {n:,} triangles; median triangle area={med_area:.6g}, "
+          f"median min edge={median_edge:.6g}")
+    for key,value in counts.items():
+        if value:
+            print(f"  {key:<24}: {value:,}")
+    # Intersections queried against all surface triangles, not just suspects.
+    seeds = _diag_select_seeds(flags,face_ids,wall_fid,qualities,n)
+    pair_info = {'scan_mode':str(DIAG_INTERSECTION_SCAN_MODE),
+                 'seed_triangles_examined':0,'triangle_pair_tests':0,
+                 'scan_complete_within_limits':True}
+    confirmed = []
+    if len(seeds):
+        print(f"  Testing potential geometric intersections ({len(seeds):,} seed triangles)...",
+              flush=True)
+        confirmed,pair_info = _diag_tritri_pairs(surface,pts,faces,seeds)
+        pair_info['scan_mode'] = str(DIAG_INTERSECTION_SCAN_MODE)
+        if confirmed:
+            flags[np.unique(np.asarray(confirmed,dtype=np.int64))] |= 32
+    counts['self_intersection'] = int(np.count_nonzero(flags & 32))
+    print(f"  Confirmed intersecting triangle pairs: {len(confirmed):,}",flush=True)
+    # Save physical crossing locations separately from cluster centroids.
+    # Exact=True is only used for non-coplanar segment/triangle hits.
+    crossing_rows=[]
+    for a,b in confirmed:
+        loc,was_exact=_diag_intersection_xyz(pts,faces[a],faces[b])
+        crossing_rows.append({
+            'TriangleA':int(a),'TriangleB':int(b),
+            'X':float(loc[0]),'Y':float(loc[1]),'Z':float(loc[2]),
+            'FaceA':assignments.get(int(face_ids[a]),str(int(face_ids[a]))),
+            'FaceB':assignments.get(int(face_ids[b]),str(int(face_ids[b]))),
+            'ExactNoncoplanarCrossing':bool(was_exact),
+        })
+    with (outdir/'confirmed_intersections.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.DictWriter(f,fieldnames=[
+            'TriangleA','TriangleB','X','Y','Z','FaceA','FaceB','ExactNoncoplanarCrossing'])
+        writer.writeheader()
+        writer.writerows(crossing_rows)
+    if crossing_rows:
+        locations=np.asarray([[r['X'],r['Y'],r['Z']] for r in crossing_rows],dtype=float)
+        locations_mesh=pv.PolyData(locations)
+        locations_mesh.point_data['TriangleA']=np.asarray(
+            [r['TriangleA'] for r in crossing_rows],dtype=np.int32)
+        locations_mesh.point_data['TriangleB']=np.asarray(
+            [r['TriangleB'] for r in crossing_rows],dtype=np.int32)
+        locations_mesh.point_data['ExactCrossing']=np.asarray(
+            [r['ExactNoncoplanarCrossing'] for r in crossing_rows],dtype=np.int8)
+        locations_mesh.save(str(outdir/'confirmed_intersection_locations.vtp'))
+    elif (outdir/'confirmed_intersection_locations.vtp').exists():
+        (outdir/'confirmed_intersection_locations.vtp').unlink()
+    # Make a compact marked map of the strongest risks for interactive ParaView.
+    marked = np.flatnonzero(flags)
+    total_marked = int(len(marked))
+    if len(marked)>DIAG_MAX_MARKED_TRIANGLES:
+        weights = ((flags[marked]&32)>0).astype(np.float64)*1000 + \
+                  ((flags[marked]&16)>0).astype(np.float64)*100 + \
+                  ((flags[marked]&1)>0).astype(np.float64)*60 + \
+                  1.0/np.maximum(qualities[marked],1e-5)
+        confirmed_ids = marked[(flags[marked]&32)>0]
+        confirmed_ids = confirmed_ids[:DIAG_MAX_MARKED_TRIANGLES]
+        budget_other = max(0,DIAG_MAX_MARKED_TRIANGLES-len(confirmed_ids))
+        remaining=marked[(flags[marked]&32)==0]
+        remaining_weights=weights[(flags[marked]&32)==0]
+        if budget_other and len(remaining)>budget_other:
+            subset = np.argpartition(remaining_weights,-budget_other)[-budget_other:]
+            remaining = remaining[subset]
+        elif not budget_other:
+            remaining = np.empty(0,dtype=np.int64)
+        marked = np.sort(np.concatenate((confirmed_ids,remaining)))
+        print(f"  Marking {len(marked):,} of {total_marked:,} risky triangles (top severity)")
+    if len(marked):
+        debug = surface.extract_cells(marked).extract_surface()
+        debug.cell_data['OriginalCellID'] = marked
+        debug.cell_data['ProblemFlags'] = flags[marked]
+        debug.cell_data['TriangleQuality'] = qualities[marked]
+        debug.cell_data['EdgeRatio'] = edge_ratios[marked]
+        debug.cell_data['TriangleArea'] = areas[marked]
+        debug.save(str(outdir/'suspect_triangles.vtp'))
+    # Cluster via centroids, only among exported candidate triangles.
+    centers = np.zeros((len(marked),3),dtype=np.float64)
+    for a in range(0,len(marked),150000):
+        b = min(a+150000,len(marked))
+        centers[a:b] = pts[faces[marked[a:b]]].mean(axis=1)
+    radius = max(median_edge*DIAG_CLUSTER_RADIUS_MEDIAN_EDGE_FACTOR,
+                 diag*DIAG_CLUSTER_RADIUS_BBOX_FACTOR,1e-9)
+    clusters = _diag_components(centers,radius)
+    if len(marked):
+        debug.cell_data['ProblemClusterID'] = clusters
+        debug.save(str(outdir/'suspect_triangles.vtp'))
+    # Build region severity (confirmed crossings are higher priority).
+    records=[]
+    full_region_count = 0
+    if len(clusters):
+        sorted_local = np.argsort(clusters,kind='stable')
+        sorted_clusters = clusters[sorted_local]
+        unique_clusters,first,cl_count = np.unique(
+            sorted_clusters,return_index=True,return_counts=True)
+        full_region_count = int(len(unique_clusters))
+        # Keep the largest regions plus every cluster containing a confirmed
+        # intersection. Sorting once avoids an O(n_clusters * n_triangles)
+        # search on heavily speckled million-face surfaces.
+        sizes_order = np.argsort(-cl_count,kind='stable')[:DIAG_MAX_REGION_RECORDS]
+        intersects = np.flatnonzero(flags[marked]&32)
+        key_confirmed = np.unique(clusters[intersects])
+        forced = np.searchsorted(unique_clusters,key_confirmed)
+        ordered_region_positions = list(dict.fromkeys(
+            np.concatenate((forced,sizes_order)).tolist()))
+        for position in ordered_region_positions:
+            cluster=unique_clusters[position]
+            local=sorted_local[first[position]:first[position]+cl_count[position]]
+            src=marked[local]
+            xyz=centers[local]
+            fid_vals,fid_count=np.unique(face_ids[src],return_counts=True)
+            primary_fid=int(fid_vals[np.argmax(fid_count)])
+            near=_diag_caps_near_position(np.mean(xyz,axis=0),caps)
+            primary_name=str(assignments.get(primary_fid,f'fid_{primary_fid}'))
+            if primary_fid == wall_fid and near is not None:
+                primary_name=f"{primary_name} (near {near[1]})"
+            merged_mask = int(np.bitwise_or.reduce(flags[src]))
+            rec={
+                'region_id':int(cluster)+1,
+                'n_suspect_triangles':int(len(src)),
+                'center_xyz':np.mean(xyz,axis=0).tolist(),
+                'min_xyz':np.min(xyz,axis=0).tolist(),
+                'max_xyz':np.max(xyz,axis=0).tolist(),
+                'nearest_named_face':primary_name,
+                'majority_face_id':primary_fid,
+                'suspected_types':_diag_flag_text(merged_mask),
+                'confirmed_intersection_triangles':int(np.count_nonzero(flags[src]&32)),
+                'minimum_triangle_quality':float(qualities[src].min()),
+                'maximum_edge_ratio':float(edge_ratios[src].max()),
+                'cluster_radius':radius,
+            }
+            rec['rank_score']=(10000*rec['confirmed_intersection_triangles']+
+                               500*int(bool(merged_mask & 16))+
+                               20*int(bool(merged_mask & 1))+
+                               rec['n_suspect_triangles'])
+            records.append(rec)
+    records.sort(key=lambda r:r['rank_score'],reverse=True)
+    # Human-readable locations for measuring/camera targeting in ParaView.
+    if records:
+        marker_pts = np.asarray([r['center_xyz'] for r in records],dtype=np.float64)
+        markers=pv.PolyData(marker_pts)
+        markers.point_data['RegionID'] = np.asarray([r['region_id'] for r in records],dtype=np.int32)
+        markers.point_data['SuspectTriangleCount'] = np.asarray([r['n_suspect_triangles'] for r in records],dtype=np.int32)
+        markers.point_data['ModelFaceID'] = np.asarray([r['majority_face_id'] for r in records],dtype=np.int32)
+        markers.point_data['ConfirmedIntersectingTriangles'] = np.asarray(
+            [r['confirmed_intersection_triangles'] for r in records],dtype=np.int32)
+        markers.save(str(outdir/'problem_region_centers.vtp'))
+    # Export localized original-surface context patches for highest priority regions.
+    if DIAG_WRITE_TOP_REGION_PATCHES and records:
+        print('  Writing localized patches for highest-priority regions...',flush=True)
+        loc = vtk.vtkStaticCellLocator()
+        loc.SetDataSet(surface)
+        loc.BuildLocator()
+        for rec in records[:DIAG_WRITE_TOP_REGION_PATCHES]:
+            _diag_export_region_context(surface,loc,pts,faces,rec,outdir)
+    report={
+        'input_surface':str(RESULT_VTP),
+        'units':"input model coordinate units (unchanged)",
+        'triangle_count':int(n),
+        'point_count':int(len(pts)),
+        'bounding_box':list(map(float,surface.bounds)),
+        'median_triangle_area':med_area,
+        'median_shortest_edge':median_edge,
+        'absolute_degeneracy_area_threshold':zero_threshold,
+        'flags':{str(bit):name for bit,name in _DFLAG_NAMES.items()},
+        'total_suspect_triangles':total_marked,
+        'reported_suspect_triangles':int(len(marked)),
+        'issue_counts':counts,
+        'topology_edge_counts':topology,
+        'cap_quality':cap_records,
+        'intersection_analysis':pair_info,
+        'intersecting_triangle_pairs':[[int(a),int(b)] for a,b in confirmed],
+        'intersection_locations':crossing_rows,
+        'region_count_reported':len(records),
+        'region_count_total':full_region_count,
+        'regions':records,
+        'limitations':[
+            'Risk metrics do not establish the location of a Gmsh PLC failure.',
+            'Targeted self-intersection scan is incomplete and can miss intersections.',
+            'Triangles sharing a vertex ID are excluded from intersection tests.',
+            'Cap names are transferred from reference geometry and can be wrong if a cap was not assigned.',
+            'Context STL patches are OPEN inspection overlays, not watertight mesh replacements.',
+        ],
+    }
+    report_json=outdir/'diagnostic_report.json'
+    report_json.write_text(json.dumps(report,indent=2,default=_diag_json_native),encoding='utf-8')
+    with (outdir/'problem_regions.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.writer(f)
+        writer.writerow(['Rank','RegionID','SuspectTriangles','ConfirmedIntersectionTriangles',
+                         'FaceName','ModelFaceID','Issues','X','Y','Z','MinX','MinY','MinZ',
+                         'MaxX','MaxY','MaxZ','MinTriangleQuality','MaxEdgeRatio','PatchVTP'])
+        for rank,r in enumerate(records,1):
+            writer.writerow([rank,r['region_id'],r['n_suspect_triangles'],
+                             r['confirmed_intersection_triangles'],r['nearest_named_face'],
+                             r['majority_face_id'],r['suspected_types'],
+                             *r['center_xyz'],*r['min_xyz'],*r['max_xyz'],
+                             r['minimum_triangle_quality'],r['maximum_edge_ratio'],
+                             r.get('context_file','')])
+    print(f"  Spatial clusters: {full_region_count:,}; detailed records: {len(records):,}")
+    print('\n  TOP LOCALIZED PROBLEM REGIONS',flush=True)
+    if not records:
+        print('    No triangles triggered the configured risk metrics.')
+    for rank,r in enumerate(records[:DIAG_REPORT_TOP_REGIONS],1):
+        xyz=r['center_xyz']
+        print(f"    {rank:>3}. region={r['region_id']}  face={r['nearest_named_face']} "
+              f"(fid={r['majority_face_id']})  n={r['n_suspect_triangles']}  "
+              f"crossing_triangles={r['confirmed_intersection_triangles']}")
+        print(f"         XYZ=({xyz[0]:.6g}, {xyz[1]:.6g}, {xyz[2]:.6g})  "
+              f"types={r['suspected_types']}")
+    print(f"\n  REPORT: {report_json}")
+    print(f"  CSV   : {outdir/'problem_regions.csv'}")
+    print(f"  ParaView markers: {outdir/'problem_region_centers.vtp'}")
+    print(f"  Inspect problem triangles: {outdir/'suspect_triangles.vtp'}")
+    print(f"  Intersection coordinates: {outdir/'confirmed_intersections.csv'}")
+    if DIAG_INTERSECTION_SCAN_MODE.lower()=='targeted':
+        print('  NOTE: targeted intersection scan is not exhaustive; zero findings is not proof.')
+    return report
 
 
 # ============================================================================
@@ -1157,6 +1814,20 @@ def main():
     print(f"  Labelled surface: {OUTPUT_VTP}")
     print(f"  Facenames       : {OUTPUT_FACENAMES}")
 
+    if DIAGNOSTICS_ENABLED:
+        diagnostic_report = run_surface_diagnostics(
+            labelled, assignments, caps, wall_fid, output_parent
+        )
+        if (DIAG_ABORT_ON_CONFIRMED_INTERSECTIONS
+                and diagnostic_report['intersection_analysis'].get('confirmed_intersecting_pairs_found', 0)):
+            raise RuntimeError(
+                'Confirmed self-intersections were found; inspect surface_diagnostics first.'
+            )
+
+    if DIAGNOSTICS_ONLY:
+        print('\nDIAGNOSTICS_ONLY=True: report written; Gmsh volume meshing skipped.')
+        return
+
     validate_closed_surface(labelled)
 
     # Orient normals for a closed surface before STL export.  Gmsh generally
@@ -1185,10 +1856,34 @@ def main():
     print(f"\nWriting temporary Gmsh surface: {stl_path}")
     gmsh_surface.save(stl_path)
 
-    points, node_tags, tets, tet_tags = run_gmsh(
-        stl_path,
-        msh_path,
-    )
+    try:
+        points, node_tags, tets, tet_tags = run_gmsh(
+            stl_path,
+            msh_path,
+        )
+    except Exception as exc:
+        if DIAGNOSTICS_ENABLED:
+            diag_dir = output_parent / DIAGNOSTICS_FOLDER
+            # Save the exact Gmsh exception with the spatial QA report.
+            report_path = diag_dir / 'diagnostic_report.json'
+            if report_path.exists():
+                try:
+                    report_data = json.loads(report_path.read_text(encoding='utf-8'))
+                    report_data['gmsh_failure'] = str(exc)
+                    report_path.write_text(json.dumps(report_data,indent=2),encoding='utf-8')
+                except Exception as log_exc:
+                    print('  Could not append Gmsh error to diagnostic report:', log_exc)
+            print('\n' + '=' * 72)
+            print('GMSH FAILED — GEOMETRY DIAGNOSTICS ARE AVAILABLE')
+            print('=' * 72)
+            print('  Error:', exc)
+            print('  Spatial clusters + face names:', diag_dir / 'problem_regions.csv')
+            print('  Highlight problem triangles:', diag_dir / 'suspect_triangles.vtp')
+            print('  Jump to problem coordinates:', diag_dir / 'problem_region_centers.vtp')
+            print('  Inspect region_####_context.stl alongside the full original in Meshmixer.')
+            print('  IMPORTANT: reported regions are candidate defects, not a ')
+            print('  Gmsh-confirmed PLC failure coordinate.')
+        raise
 
     print("\nBuilding SimVascular volume mesh arrays...")
     volume_grid = build_volume_grid(
@@ -1221,7 +1916,6 @@ def main():
 
     print("\nDONE")
     print(
-        "In SimVascular MultiPhysics, use 'Add Mesh-Complete' and select:\n"
         f"  {MESH_COMPLETE_DIR}"
     )
 
