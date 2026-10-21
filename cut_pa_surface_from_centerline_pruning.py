@@ -2,6 +2,7 @@ import vtk
 import os
 import math
 from collections import defaultdict
+from time import perf_counter
 
 # Refinement version: exact VTK clipping + permissive retry/skip +
 # local cross-section shape, small-opening, and overlap QC.
@@ -22,7 +23,7 @@ FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Net
 TRIMMED_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Centerline_Trimmed.vtp"
 
 # Original pulmonary artery surface to prune.
-SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\pulmonary_artery_1.vtp"
+SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Full_Tree_Meshed.vtp"
 
 # Exact-clipped PA tree with the new outlet rings left OPEN.
 # This is the most useful QC output because you can inspect the new
@@ -232,6 +233,27 @@ SKIP_FAILED_OUTLET_CUTS = True
 VERBOSE_CUT_LOG = False
 PROGRESS_PRINT_EVERY = 50
 
+# -------------------------------------------------------------------------
+# Performance settings
+# -------------------------------------------------------------------------
+# Exact cuts used to clean + triangulate the ENTIRE ~600k-cell surface after
+# every individual outlet. That is safe but extremely expensive for ~1000
+# outlets. The local cut itself is still exact; we now defer the global weld/
+# triangulation and do it in batches. Set to 1 to recover the old behavior.
+EXACT_CUT_GLOBAL_CLEAN_INTERVAL = 25
+
+# The final endpoint safety sweep similarly used to run vtkCleanPolyData and
+# vtkTriangleFilter after every one of ~1000 boxes. The box clipping remains
+# exact, but global cleanup is deferred to this interval and once at the end.
+# Set to 1 for the old behavior.
+END_BOX_GLOBAL_CLEAN_INTERVAL = 100
+
+# Old versions built a temporary flat cap for every exact cut even though the
+# final workflow discards those caps and rebuilds better radial-ring caps only
+# after ALL cleanup. Leave this False for a substantial amount of wasted work
+# to be skipped.
+BUILD_LEGACY_PER_CUT_CAPS = False
+
 # If the retained centerline terminates at a pruning junction, make one
 # transverse cut using the last retained branch direction. Positive values
 # move the plane slightly upstream into the retained parent branch.
@@ -356,7 +378,7 @@ QUALITY_BOX_MERGE_DISTANCE_FACTOR = 1.25
 # extends only downstream. This removes overlapping triangles, tiny residual
 # caps, spikes, and distal fragments without unnecessarily moving the opening
 # farther toward the parent vessel.
-ENABLE_FINAL_END_BOX_SWEEP = True
+ENABLE_FINAL_END_BOX_SWEEP = False
 
 # Requested: endpoint boxes are 2x the current mesh-quality box size.
 END_BOX_SIZE_MULTIPLIER = 2.0
@@ -2598,53 +2620,60 @@ def find_downstream_neighbor_cells(surface, crossing_ids, plane):
 # ============================================================
 
 def extract_cells_by_flag(surface, selected_ids, want_selected):
+    """
+    Extract selected or unselected cells using vtkExtractSelection.
 
-    flagged = vtk.vtkPolyData()
-    flagged.DeepCopy(surface)
+    The older implementation deep-copied the complete surface, allocated a
+    temporary flag array, and then looped over EVERY surface cell in Python for
+    every cut. With ~600k triangles and ~1000 outlets that was one of the main
+    runtime bottlenecks. vtkSelection performs the same subset/complement
+    operation in compiled VTK code and only requires us to list the relatively
+    small set of affected cell IDs.
+    """
 
-    arr = vtk.vtkIntArray()
-    arr.SetName("__TargetCutCell")
-    arr.SetNumberOfComponents(1)
-    arr.SetNumberOfTuples(flagged.GetNumberOfCells())
+    selected_ids = sorted(int(cid) for cid in selected_ids)
 
-    for cell_id in range(flagged.GetNumberOfCells()):
+    if len(selected_ids) == 0:
+        if want_selected:
+            return vtk.vtkPolyData()
+        out = vtk.vtkPolyData()
+        out.ShallowCopy(surface)
+        return out
 
-        is_selected = cell_id in selected_ids
+    id_array = vtk.vtkIdTypeArray()
+    id_array.SetNumberOfComponents(1)
+    id_array.SetNumberOfTuples(len(selected_ids))
 
-        arr.SetTuple1(
-            cell_id,
-            1 if is_selected else 0
-        )
+    for i, cid in enumerate(selected_ids):
+        id_array.SetValue(i, cid)
 
-    flagged.GetCellData().AddArray(arr)
+    node = vtk.vtkSelectionNode()
+    node.SetFieldType(vtk.vtkSelectionNode.CELL)
+    node.SetContentType(vtk.vtkSelectionNode.INDICES)
+    node.SetSelectionList(id_array)
 
-    threshold = vtk.vtkThreshold()
-    threshold.SetInputData(flagged)
-    threshold.SetInputArrayToProcess(
-        0,
-        0,
-        0,
-        vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS,
-        "__TargetCutCell"
-    )
+    if not want_selected:
+        node.GetProperties().Set(vtk.vtkSelectionNode.INVERSE(), 1)
 
-    target_value = 1.0 if want_selected else 0.0
+    selection = vtk.vtkSelection()
+    selection.AddNode(node)
 
-    threshold.SetLowerThreshold(target_value - 0.1)
-    threshold.SetUpperThreshold(target_value + 0.1)
-    threshold.SetThresholdFunction(
-        vtk.vtkThreshold.THRESHOLD_BETWEEN
-    )
-    threshold.Update()
+    extract = vtk.vtkExtractSelection()
+    extract.SetInputData(0, surface)
+    extract.SetInputData(1, selection)
+    extract.Update()
 
     geometry = vtk.vtkGeometryFilter()
-    geometry.SetInputConnection(
-        threshold.GetOutputPort()
-    )
+    geometry.SetInputConnection(extract.GetOutputPort())
     geometry.Update()
 
     out = vtk.vtkPolyData()
-    out.DeepCopy(geometry.GetOutput())
+    out.ShallowCopy(geometry.GetOutput())
+
+    # vtkExtractSelection may add bookkeeping arrays. They are harmless, but
+    # removing them prevents repeated cuts from accumulating unused metadata.
+    out.GetCellData().RemoveArray("vtkOriginalCellIds")
+    out.GetPointData().RemoveArray("vtkOriginalPointIds")
 
     return out
 
@@ -2704,7 +2733,7 @@ def build_flat_cap(loop):
 # interpolated planar boundary.
 # ============================================================
 
-def apply_exact_local_plane_cut(surface, cut):
+def apply_exact_local_plane_cut(surface, cut, cleanup_result=True):
 
     loop, plane, stats = (
         find_target_cut_loop(
@@ -2782,19 +2811,29 @@ def apply_exact_local_plane_cut(surface, cut):
     append.Update()
 
     result = vtk.vtkPolyData()
-    result.DeepCopy(append.GetOutput())
+    result.ShallowCopy(append.GetOutput())
 
-    result = clean_polydata(
-        result,
-        MERGE_TOLERANCE
-    )
+    # The two inputs are already triangles. Welding the entire pulmonary
+    # surface is useful for long-term topology, but doing it after every single
+    # outlet dominates runtime. The caller batches this operation instead.
+    if cleanup_result:
+        result = clean_polydata(
+            result,
+            MERGE_TOLERANCE
+        )
+        result = triangulate_polydata(result)
 
-    result = triangulate_polydata(result)
-
-    # Remove the internal selection flag before the next cut iteration.
     result.GetCellData().RemoveArray("__TargetCutCell")
+    result.GetCellData().RemoveArray("vtkOriginalCellIds")
+    result.GetPointData().RemoveArray("vtkOriginalPointIds")
 
-    cap = build_flat_cap(loop)
+    # These per-cut caps are obsolete in the current workflow: final caps are
+    # rebuilt from the ACTUAL final boundary loops after end-box and quality
+    # cleanup. Avoid ~1000 unnecessary contour triangulations by default.
+    if BUILD_LEGACY_PER_CUT_CAPS:
+        cap = build_flat_cap(loop)
+    else:
+        cap = None
 
     return result, loop, cap, stats
 
@@ -2816,7 +2855,7 @@ class CutRetriesExhausted(RuntimeError):
         )
 
 
-def apply_cut_with_retries(surface, cut):
+def apply_cut_with_retries(surface, cut, cleanup_result=True):
 
     # Always try the originally planned plane first. Only if that attempt
     # fails do we walk to nearby positions on the same centerline cell.
@@ -2868,7 +2907,8 @@ def apply_cut_with_retries(surface, cut):
             result, loop, cap, stats = (
                 apply_exact_local_plane_cut(
                     surface,
-                    candidate
+                    candidate,
+                    cleanup_result=cleanup_result
                 )
             )
 
@@ -3998,7 +4038,7 @@ def build_oriented_vtk_box(plan):
     return box, u, v
 
 
-def clip_out_quality_box(surface, plan):
+def clip_out_quality_box(surface, plan, cleanup_result=True):
     """
     Remove the inside of one oriented box using vtkBoxClipDataSet.
 
@@ -4062,10 +4102,15 @@ def clip_out_quality_box(surface, plan):
     geometry.Update()
 
     out = vtk.vtkPolyData()
-    out.DeepCopy(geometry.GetOutput())
+    out.ShallowCopy(geometry.GetOutput())
 
-    out = clean_polydata(out, MERGE_TOLERANCE)
-    out = triangulate_polydata(out)
+    # vtkBoxClipDataSet performs the geometric split itself. Global point
+    # welding/triangulation can therefore be deferred safely during the large
+    # endpoint sweep and done periodically + once at the end. Quality-cleanup
+    # boxes still use cleanup_result=True by default.
+    if cleanup_result:
+        out = clean_polydata(out, MERGE_TOLERANCE)
+        out = triangulate_polydata(out)
 
     return out
 
@@ -4467,7 +4512,7 @@ def run_final_end_box_sweep(
             locality_skips += 1
             continue
 
-        candidate = clip_out_quality_box(working, plan)
+        candidate = clip_out_quality_box(working, plan, cleanup_result=False)
 
         if (
             candidate.GetNumberOfPoints() == 0
@@ -4482,6 +4527,13 @@ def run_final_end_box_sweep(
             make_end_box_debug_polydata(plan, applied)
         )
         applied += 1
+
+        if (
+            END_BOX_GLOBAL_CLEAN_INTERVAL > 0
+            and applied % END_BOX_GLOBAL_CLEAN_INTERVAL == 0
+        ):
+            working = clean_polydata(working, MERGE_TOLERANCE)
+            working = triangulate_polydata(working)
 
         if (
             PROGRESS_PRINT_EVERY > 0
@@ -4900,12 +4952,12 @@ print("Triangulated surface cells:", working_surface.GetNumberOfCells())
 # ============================================================
 
 selected_loops = []
-flat_caps = []
 successful_cut_indices = []
 skipped_pruning_cut_indices = []
 skipped_outlet_cut_indices = []
 failed_cut_attempts = []
 accepted_cut_by_index = {}
+exact_cuts_since_global_clean = 0
 
 print("")
 print("============================================")
@@ -4938,12 +4990,13 @@ for cut_index, cut in enumerate(pruning_cuts):
         (
             working_surface,
             loop,
-            cap,
+            _cap,
             stats,
             used_cut
         ) = apply_cut_with_retries(
             working_surface,
-            cut
+            cut,
+            cleanup_result=False
         )
 
         selected_loops.append(
@@ -4954,14 +5007,19 @@ for cut_index, cut in enumerate(pruning_cuts):
             )
         )
 
-        flat_caps.append(
-            (cut_index, used_cut, cap)
-        )
-
         successful_cut_indices.append(
             cut_index
         )
         accepted_cut_by_index[cut_index] = dict(used_cut)
+
+        exact_cuts_since_global_clean += 1
+        if (
+            EXACT_CUT_GLOBAL_CLEAN_INTERVAL > 0
+            and exact_cuts_since_global_clean >= EXACT_CUT_GLOBAL_CLEAN_INTERVAL
+        ):
+            working_surface = clean_polydata(working_surface, MERGE_TOLERANCE)
+            working_surface = triangulate_polydata(working_surface)
+            exact_cuts_since_global_clean = 0
 
         if VERBOSE_CUT_LOG:
             print("    Target loop points:", stats["num_loop_points"])
@@ -5040,6 +5098,14 @@ for cut_index, cut in enumerate(pruning_cuts):
 
 if len(pruning_cuts) > 0:
 
+    # A batched exact cut may leave coincident seam points unwelded until the
+    # next global clean. Weld once BEFORE connectivity so the retained proximal
+    # cut fragments are recognized as part of the inlet-connected surface.
+    if exact_cuts_since_global_clean > 0:
+        working_surface = clean_polydata(working_surface, MERGE_TOLERANCE)
+        working_surface = triangulate_polydata(working_surface)
+        exact_cuts_since_global_clean = 0
+
     working_surface = keep_inlet_connected_region(
         working_surface,
         inlet_xyz
@@ -5048,6 +5114,7 @@ if len(pruning_cuts) > 0:
     working_surface = triangulate_polydata(
         working_surface
     )
+    exact_cuts_since_global_clean = 0
 
     print("")
     print(
@@ -5103,12 +5170,13 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
         (
             working_surface,
             loop,
-            cap,
+            _cap,
             stats,
             used_cut
         ) = apply_cut_with_retries(
             working_surface,
-            cut
+            cut,
+            cleanup_result=False
         )
 
         selected_loops.append(
@@ -5119,16 +5187,20 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             )
         )
 
-        flat_caps.append(
-            (cut_index, used_cut, cap)
-        )
-
         successful_cut_indices.append(
             cut_index
         )
         accepted_cut_by_index[cut_index] = dict(used_cut)
 
         outlet_success_count += 1
+        exact_cuts_since_global_clean += 1
+        if (
+            EXACT_CUT_GLOBAL_CLEAN_INTERVAL > 0
+            and exact_cuts_since_global_clean >= EXACT_CUT_GLOBAL_CLEAN_INTERVAL
+        ):
+            working_surface = clean_polydata(working_surface, MERGE_TOLERANCE)
+            working_surface = triangulate_polydata(working_surface)
+            exact_cuts_since_global_clean = 0
 
         if VERBOSE_CUT_LOG:
             print("    Target loop points:", stats["num_loop_points"])
@@ -5210,6 +5282,12 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             raise
 
 print("")
+# Final weld after batched exact cuts before connectivity/debug output.
+if exact_cuts_since_global_clean > 0:
+    working_surface = clean_polydata(working_surface, MERGE_TOLERANCE)
+    working_surface = triangulate_polydata(working_surface)
+    exact_cuts_since_global_clean = 0
+
 print("Pruning cuts skipped:", len(skipped_pruning_cut_indices))
 print("IsOutlet cuts completed:", outlet_success_count)
 print("IsOutlet cuts skipped:", outlet_skip_count)
@@ -5406,6 +5484,10 @@ if ENABLE_FINAL_END_BOX_SWEEP:
 # FINAL MESH-QUALITY / SPIKE CLEANUP
 # ============================================================
 
+# The endpoint-box sweep is now the direct input to mesh-quality cleanup.
+# This variable was accidentally left undefined in the previous revision.
+quality_cleanup_input = end_box_open
+
 if ENABLE_MESH_QUALITY_CLEANUP:
 
     (
@@ -5563,7 +5645,10 @@ print("============================================")
 print("FINISHED")
 print("============================================")
 print("")
-print("Primary final OPEN output:", OUTPUT_QUALITY_CLEANED_FILE)
+if ENABLE_MESH_QUALITY_CLEANUP:
+    print("Primary final OPEN output:", OUTPUT_QUALITY_CLEANED_FILE)
+else:
+    print("Primary final OPEN output:", END_BOX_OPEN_OUTPUT_FILE)
 if WRITE_CAPPED_OUTPUT:
     print("Primary final CAPPED face model:", OUTPUT_CAPPED_FILE)
     print("SimVascular facenames:", OUTPUT_CAPPED_FACENAMES)
