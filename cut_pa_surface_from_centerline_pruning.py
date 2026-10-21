@@ -3,9 +3,8 @@ import os
 import math
 from collections import defaultdict
 
-
 # Refinement version: exact VTK clipping + permissive retry/skip +
-# local cross-section area/shape QC for detecting mangled branch-like caps.
+# local cross-section shape, small-opening, and overlap QC.
 
 # Refinement: every local cut can retry at nearby positions along its
 # associated centerline branch. In exploratory/permissive mode, a cut that
@@ -23,7 +22,7 @@ FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Net
 TRIMMED_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Centerline_Trimmed.vtp"
 
 # Original pulmonary artery surface to prune.
-SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Full_Tree_Meshed.vtp"
+SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\pulmonary_artery_1.vtp"
 
 # Exact-clipped PA tree with the new outlet rings left OPEN.
 # This is the most useful QC output because you can inspect the new
@@ -65,7 +64,7 @@ RADIUS_ARRAY = "Radius"
 # selected by VTK is plausibly the vessel surrounding this centerline.
 # The exact cut itself is made from the true plane/surface intersection;
 # it is NOT approximated by this circle.
-CUT_RADIUS_FACTOR = 1.35
+CUT_RADIUS_FACTOR = 1.85
 
 # When a side branch disappears from the trimmed centerline, move the
 # plane slightly INTO the removed branch so we are not cutting directly
@@ -93,6 +92,8 @@ TERMINAL_RETRY_RADIUS_OFFSETS = (
     1.00,
     1.50,
     2.00,
+    3.00,
+    5.00,
 )
 
 SIDE_BRANCH_RETRY_RADIUS_OFFSETS = (
@@ -165,6 +166,34 @@ MAX_LOOP_RADIAL_ASYMMETRY = 2.25
 # that the plane picked up the wrong/compound region. Expressed in local radii.
 MAX_LOOP_CENTROID_OFFSET_TO_RADIUS = 1.50
 
+# -------------------------------------------------------------------------
+# Small-opening / overlapping-contour quality control
+# -------------------------------------------------------------------------
+#
+# Radius can collapse artificially at a terminal cap, so the ordinary
+# A/(pi*r^2) test can sometimes accept a physically tiny opening simply
+# because the centerline Radius at that exact point is also tiny.  Each cut
+# therefore carries a robust reference radius taken from the WHOLE source
+# centerline cell.  The equivalent radius of the proposed opening must be at
+# least this fraction of that branch-scale reference radius.
+MIN_OPENING_EFFECTIVE_RADIUS_TO_REFERENCE = 0.45
+
+# A clean vtkCutter contour contains each geometric line segment once.
+# Coincident/overlapping surface triangles can contribute duplicate cutter
+# segments, making the total raw segment length appreciably larger than the
+# perimeter of the stripped contour.
+MAX_LOOP_SEGMENT_REDUNDANCY_RATIO = 1.10
+
+# A valid vessel cross-section should be a simple non-self-intersecting loop.
+# Any crossing of non-adjacent projected contour edges is treated as evidence
+# of overlapping/self-intersecting elements and triggers an upstream retry.
+MAX_LOOP_SELF_INTERSECTIONS = 0
+
+# Non-adjacent contour vertices that collapse onto essentially the same
+# location are another indication of a self-touching/overlapping opening.
+# Tolerance is expressed as a fraction of the branch reference radius.
+OVERLAP_VERTEX_TOLERANCE_FACTOR = 1.0e-4
+
 # Exploratory mode requested for refinement: if all candidate locations for
 # an individual cut fail, skip ONLY that cut and continue processing the
 # remaining tree. The skipped/failed attempt circles are written to a debug
@@ -195,7 +224,7 @@ TERMINAL_OFFSET_FRACTION = 0.0
 #
 # A modest positive value is usually preferable because it removes the old
 # distal tip/cap and leaves a real vessel cross-section for the exact VTK cut.
-OUTLET_OFFSET_FRACTION = 0.75
+OUTLET_OFFSET_FRACTION = 1.75
 
 # For IsOutlet cuts only: after vtkCutter finds the closest plane/surface
 # contour, require that contour to be reasonably local to the centerline
@@ -275,17 +304,17 @@ MESH_QUALITY_TRIANGLE_MEASURE = "AspectRatio"
 #
 # radial half-width must exceed the vessel radius so the box fully severs the
 # vessel rather than merely punching a rectangular side hole.
-QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR = 1.75
+QUALITY_BOX_RADIAL_HALF_WIDTH_FACTOR = 3.75
 
 # The box is centered at the nearest centerline location.  Therefore this
 # axial half-length also controls how far toward the parent vessel the new
 # retained opening is moved away from the bad elements.
-QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR = 1.25
+QUALITY_BOX_AXIAL_HALF_LENGTH_FACTOR = 3.25
 
 # Multiple disconnected bad-cell clusters can belong to the same spike.
 # If their proposed box centers are closer than this many local radii, merge
 # them into a single box to avoid repeatedly chopping the same location.
-QUALITY_BOX_MERGE_DISTANCE_FACTOR = 1.25
+QUALITY_BOX_MERGE_DISTANCE_FACTOR = 3.25
 
 # A single cleanup pass is intentionally conservative.  The script reports
 # any Quality > threshold cells that remain afterward so they can be inspected
@@ -584,6 +613,37 @@ def polyline_total_length(centerline, point_ids):
         )
 
     return total
+
+
+def robust_cell_reference_radius(centerline, cell_id, radius_array):
+
+    cell = centerline.GetCell(int(cell_id))
+
+    if cell is None or cell.GetNumberOfPoints() == 0:
+        return None
+
+    values = []
+
+    for i in range(cell.GetNumberOfPoints()):
+        point_id = int(cell.GetPointId(i))
+        r = float(radius_array.GetTuple1(point_id))
+
+        if math.isfinite(r) and r > 0.0:
+            values.append(r)
+
+    if len(values) == 0:
+        return None
+
+    # Median is deliberately used instead of the endpoint value.  It is
+    # stable when Radius collapses near an old cap but does not force the
+    # distal opening to be as large as the proximal end of a tapering vessel.
+    values.sort()
+    mid = len(values) // 2
+
+    if len(values) % 2 == 1:
+        return float(values[mid])
+
+    return 0.5 * float(values[mid - 1] + values[mid])
 
 
 def sample_centerline_cell_at_distance(
@@ -1077,12 +1137,22 @@ def build_cut_definitions(full_centerline, retained_cell_ids):
 
             radius = max(valid_radii)
 
+            reference_radius = robust_cell_reference_radius(
+                full_centerline,
+                kept["cell_id"],
+                radius_array
+            )
+
+            if reference_radius is None:
+                reference_radius = radius
+
             base_cut = {
                 "type": "terminal",
                 "center": cut_center,
                 "junction": junction,
                 "normal": normal,
                 "radius": radius,
+                "reference_radius": reference_radius,
                 "cut_radius": radius * CUT_RADIUS_FACTOR,
                 "source_cell_id": kept["cell_id"],
                 "source_endpoint_local_id": kept["endpoint_local_id"],
@@ -1167,12 +1237,22 @@ def build_cut_definitions(full_centerline, retained_cell_ids):
 
                 radius = min(valid_radii)
 
+                reference_radius = robust_cell_reference_radius(
+                    full_centerline,
+                    removed["cell_id"],
+                    radius_array
+                )
+
+                if reference_radius is None:
+                    reference_radius = radius
+
                 base_cut = {
                     "type": "side_branch",
                     "center": cut_center,
                     "junction": junction,
                     "normal": normal,
                     "radius": radius,
+                    "reference_radius": reference_radius,
                     "cut_radius": radius * CUT_RADIUS_FACTOR,
                     "source_cell_id": removed["cell_id"],
                     "source_endpoint_local_id": removed["endpoint_local_id"],
@@ -1334,12 +1414,22 @@ def build_outlet_cut_definitions(trimmed_centerline):
         # conservative, especially where Radius collapses near an old cap.
         radius = max(valid_radii)
 
+        reference_radius = robust_cell_reference_radius(
+            trimmed_centerline,
+            source_cell_id,
+            radius_array
+        )
+
+        if reference_radius is None:
+            reference_radius = radius
+
         base_cut = {
             "type": "outlet",
             "center": cut_center,
             "junction": outlet,
             "normal": normal,
             "radius": radius,
+            "reference_radius": reference_radius,
             "cut_radius": radius * CUT_RADIUS_FACTOR,
             "source_cell_id": source_cell_id,
             "source_endpoint_local_id": source_endpoint_local_id,
@@ -1532,6 +1622,109 @@ def median_value(values):
     return 0.5 * (vals[mid - 1] + vals[mid])
 
 
+def orientation_2d(a, b, c):
+
+    return (
+        (b[0] - a[0]) * (c[1] - a[1])
+        - (b[1] - a[1]) * (c[0] - a[0])
+    )
+
+
+def point_distance_2d(a, b):
+
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def on_segment_2d(a, b, p, tol):
+
+    if abs(orientation_2d(a, b, p)) > tol:
+        return False
+
+    return (
+        min(a[0], b[0]) - tol <= p[0] <= max(a[0], b[0]) + tol
+        and min(a[1], b[1]) - tol <= p[1] <= max(a[1], b[1]) + tol
+    )
+
+
+def segments_intersect_2d(a, b, c, d, tol):
+
+    o1 = orientation_2d(a, b, c)
+    o2 = orientation_2d(a, b, d)
+    o3 = orientation_2d(c, d, a)
+    o4 = orientation_2d(c, d, b)
+
+    # Proper crossing.
+    if (
+        ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol))
+        and ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol))
+    ):
+        return True
+
+    # Collinear/self-touching cases.
+    if abs(o1) <= tol and on_segment_2d(a, b, c, tol):
+        return True
+    if abs(o2) <= tol and on_segment_2d(a, b, d, tol):
+        return True
+    if abs(o3) <= tol and on_segment_2d(c, d, a, tol):
+        return True
+    if abs(o4) <= tol and on_segment_2d(c, d, b, tol):
+        return True
+
+    return False
+
+
+def count_nonadjacent_loop_intersections(xy, tol):
+
+    n = len(xy)
+    count = 0
+
+    for i in range(n):
+        i2 = (i + 1) % n
+        a = xy[i]
+        b = xy[i2]
+
+        for j in range(i + 1, n):
+            j2 = (j + 1) % n
+
+            # Adjacent polygon edges are expected to share one endpoint.
+            if j == i or j == i2 or j2 == i:
+                continue
+
+            # First and final edges are adjacent through vertex 0.
+            if i == 0 and j2 == 0:
+                continue
+
+            c = xy[j]
+            d = xy[j2]
+
+            if segments_intersect_2d(a, b, c, d, tol):
+                count += 1
+
+    return count
+
+
+def count_nonadjacent_near_duplicate_vertices(xy, tol):
+
+    n = len(xy)
+    count = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+
+            if j == i + 1:
+                continue
+
+            if i == 0 and j == n - 1:
+                continue
+
+            if point_distance_2d(xy[i], xy[j]) <= tol:
+                count += 1
+
+    return count
+
+
 def compute_loop_shape_metrics(loop, cut):
 
     # Join cutter line segments into an ordered closed polyline. A clean
@@ -1540,6 +1733,23 @@ def compute_loop_shape_metrics(loop, cut):
         loop,
         MERGE_TOLERANCE
     )
+
+    # Total length of the raw cutter segments before vtkStripper joins them.
+    # For a clean contour this should be essentially identical to the final
+    # perimeter. Duplicate/overlapping triangles often create coincident
+    # cutter segments and inflate this value.
+    raw_segment_length = 0.0
+
+    for raw_cell_id in range(loop_clean.GetNumberOfCells()):
+        raw_cell = loop_clean.GetCell(raw_cell_id)
+
+        if raw_cell is None or raw_cell.GetNumberOfPoints() < 2:
+            continue
+
+        for raw_i in range(raw_cell.GetNumberOfPoints() - 1):
+            p0 = point_tuple(loop_clean, raw_cell.GetPointId(raw_i))
+            p1 = point_tuple(loop_clean, raw_cell.GetPointId(raw_i + 1))
+            raw_segment_length += distance(p0, p1)
 
     stripper = vtk.vtkStripper()
     stripper.SetInputData(loop_clean)
@@ -1675,6 +1885,55 @@ def compute_loop_shape_metrics(loop, cut):
     else:
         centroid_offset_ratio = float("inf")
 
+    effective_radius = (
+        math.sqrt(area / math.pi)
+        if area > 0.0
+        else 0.0
+    )
+
+    reference_radius = cut.get(
+        "reference_radius",
+        cut.get("radius", None)
+    )
+
+    if (
+        reference_radius is not None
+        and math.isfinite(float(reference_radius))
+        and float(reference_radius) > 0.0
+    ):
+        reference_radius = float(reference_radius)
+        effective_radius_ratio = effective_radius / reference_radius
+    else:
+        reference_radius = None
+        effective_radius_ratio = float("inf")
+
+    if perimeter > PLANE_EPS:
+        segment_redundancy_ratio = raw_segment_length / perimeter
+    else:
+        segment_redundancy_ratio = float("inf")
+
+    overlap_scale = (
+        reference_radius
+        if reference_radius is not None
+        else max(float(cut.get("radius", 0.0)), 1.0)
+    )
+
+    overlap_tol = max(
+        overlap_scale * OVERLAP_VERTEX_TOLERANCE_FACTOR,
+        MERGE_TOLERANCE * 100.0,
+        1e-9
+    )
+
+    self_intersections = count_nonadjacent_loop_intersections(
+        xy,
+        overlap_tol
+    )
+
+    near_duplicate_vertices = count_nonadjacent_near_duplicate_vertices(
+        xy,
+        overlap_tol
+    )
+
     return {
         "loop_area": area,
         "expected_area": expected_area,
@@ -1684,7 +1943,14 @@ def compute_loop_shape_metrics(loop, cut):
         "radial_asymmetry": radial_asymmetry,
         "shape_centroid": loop_centroid,
         "shape_centroid_offset": centroid_offset,
-        "shape_centroid_offset_ratio": centroid_offset_ratio
+        "shape_centroid_offset_ratio": centroid_offset_ratio,
+        "effective_radius": effective_radius,
+        "reference_radius": reference_radius,
+        "effective_radius_ratio": effective_radius_ratio,
+        "raw_segment_length": raw_segment_length,
+        "segment_redundancy_ratio": segment_redundancy_ratio,
+        "self_intersections": self_intersections,
+        "near_duplicate_vertices": near_duplicate_vertices
     }
 
 
@@ -1911,6 +2177,49 @@ def find_target_cut_loop(surface, cut):
                     shape_stats["shape_centroid_offset_ratio"],
                     MAX_LOOP_CENTROID_OFFSET_TO_RADIUS
                 )
+            )
+
+        if (
+            shape_stats["effective_radius_ratio"]
+            < MIN_OPENING_EFFECTIVE_RADIUS_TO_REFERENCE
+        ):
+            shape_failures.append(
+                "opening is too small relative to its branch "
+                "(effective radius/reference radius={:.3f} < {:.3f})"
+                .format(
+                    shape_stats["effective_radius_ratio"],
+                    MIN_OPENING_EFFECTIVE_RADIUS_TO_REFERENCE
+                )
+            )
+
+        if (
+            shape_stats["segment_redundancy_ratio"]
+            > MAX_LOOP_SEGMENT_REDUNDANCY_RATIO
+        ):
+            shape_failures.append(
+                "overlapping/duplicate contour segments detected "
+                "(raw length/perimeter={:.3f} > {:.3f})"
+                .format(
+                    shape_stats["segment_redundancy_ratio"],
+                    MAX_LOOP_SEGMENT_REDUNDANCY_RATIO
+                )
+            )
+
+        if (
+            shape_stats["self_intersections"]
+            > MAX_LOOP_SELF_INTERSECTIONS
+        ):
+            shape_failures.append(
+                "self-intersecting contour detected "
+                "({} non-adjacent edge intersection(s))"
+                .format(shape_stats["self_intersections"])
+            )
+
+        if shape_stats["near_duplicate_vertices"] > 0:
+            shape_failures.append(
+                "self-touching/overlapping contour detected "
+                "({} non-adjacent near-duplicate vertex pair(s))"
+                .format(shape_stats["near_duplicate_vertices"])
             )
 
         if shape_failures:
