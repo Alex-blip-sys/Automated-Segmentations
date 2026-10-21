@@ -1,0 +1,1020 @@
+"""
+cap_assign_gmsh_to_simvascular.py
+=================================
+
+End-to-end utility for:
+
+1) transferring SimVascular ModelFaceID labels from an existing reference
+   model onto a new CLOSED pulmonary-artery surface,
+2) tetrahedralizing that surface with Gmsh, and
+3) exporting a SimVascular-compatible mesh-complete directory.
+
+Expected inputs
+---------------
+BASE_VTP
+    Original/reference surface containing ModelFaceID cell data.
+OLD_FACENAMES
+    SimVascular .facenames file paired with BASE_VTP.
+RESULT_VTP
+    New CLOSED/watertight surface that should be volume meshed.  It does not
+    need ModelFaceID data; the script reassigns it from the reference caps.
+
+Primary output
+--------------
+MESH_COMPLETE_DIR/
+    mesh-complete.mesh.vtu
+    mesh-complete.exterior.vtp
+    walls_combined.vtp
+    mesh-surfaces/
+        <one .vtp file for every face name>
+
+The mesh-complete files include the SimVascular arrays:
+    volume mesh:
+        PointData GlobalNodeID
+        CellData  GlobalElementID
+        CellData  ModelRegionID
+    boundary meshes:
+        PointData GlobalNodeID
+        CellData  GlobalElementID  (owning tetrahedron ID)
+        CellData  ModelFaceID
+
+Dependencies
+------------
+    pip install numpy pyvista vtk gmsh
+
+Notes
+-----
+* RESULT_VTP MUST be closed.  If you are using the pruning workflow developed
+  earlier, use a separately capped/closed copy for meshing rather than the
+  final open QC surface.
+* This script intentionally generates FIRST-ORDER tetrahedra.
+* Gmsh is used only to generate the tetrahedral volume mesh.  Face identity is
+  transferred back from the labelled input surface after meshing, which avoids
+  relying on Gmsh's STL surface-patch numbering to match SimVascular faces.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+import gmsh
+import numpy as np
+import pyvista as pv
+
+
+# ============================================================================
+# USER SETTINGS
+# ============================================================================
+
+BASE_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp"
+OLD_FACENAMES = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Tree.vtp.facenames"
+RESULT_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result.vtp"
+
+# Labelled surface written for QC before Gmsh is called.
+OUTPUT_VTP = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result_assigned.vtp"
+OUTPUT_FACENAMES = OUTPUT_VTP + ".facenames"
+
+# Final SimVascular-ready directory.
+MESH_COMPLETE_DIR = r"C:\MS BME- Applied Study\CGRL\MODELS\trial\Result-gmsh-mesh-complete"
+
+# Optional Gmsh .msh file retained for independent QC in Gmsh/ParaView.
+KEEP_GMSH_MSH = True
+GMSH_MSH_NAME = "gmsh_volume.msh"
+
+# Keep the temporary STL that Gmsh receives.  Useful for debugging failures.
+KEEP_GMSH_STL = True
+GMSH_STL_NAME = "surface_for_gmsh.stl"
+
+
+# ============================================================================
+# CAP / FACE TRANSFER SETTINGS
+# ============================================================================
+
+# Percentile used to estimate cap radius from reference cap points.
+CAP_PERCENTILE = 95
+
+# Thickness of the cap-plane envelope used ONLY for assigning ModelFaceID to
+# RESULT_VTP before meshing.  Increase if a known planar cap gets zero cells.
+PLANE_TOL_FACTOR = 0.00005
+
+# Small enlargement of the radial cap envelope during initial face assignment.
+CAP_RADIUS_ASSIGNMENT_FACTOR = 1.02
+
+# Face transfer after Gmsh uses nearest cells on the already-labelled surface.
+# If the Gmsh boundary moves farther than this fraction of the model bounding-
+# box diagonal from the labelled input surface, print a warning.
+FACE_TRANSFER_WARN_FRACTION_OF_BBOX = 1.0e-4
+
+
+# ============================================================================
+# GMSH SETTINGS
+# ============================================================================
+
+# Angle used by Gmsh to classify an imported STL into discrete surface patches.
+# This does NOT define the final SimVascular faces; those are transferred from
+# ModelFaceID after tetrahedralization.
+GMSH_CLASSIFY_ANGLE_DEG = 40.0
+
+# 1 = Delaunay in Gmsh.  A good robust first choice for vascular geometries.
+GMSH_ALGORITHM_3D = 1
+
+# Optional global volume size limits in the SAME units as the model.
+# Leave as None to let the existing surface triangulation drive the size.
+GMSH_MIN_SIZE = None
+GMSH_MAX_SIZE = None
+
+# Run Gmsh's Netgen tetrahedral optimization after mesh generation.
+GMSH_OPTIMIZE_NETGEN = True
+
+# Suppress Gmsh GUI.  Terminal messages remain visible.
+GMSH_TERMINAL_OUTPUT = True
+
+
+# ============================================================================
+# SURFACE VALIDATION SETTINGS
+# ============================================================================
+
+# Merge duplicate input points before meshing.
+SURFACE_CLEAN_TOLERANCE = 1.0e-8
+
+# RESULT_VTP must have one connected closed component for this workflow.
+REQUIRE_SINGLE_CONNECTED_COMPONENT = True
+REQUIRE_WATERTIGHT_SURFACE = True
+REQUIRE_MANIFOLD_SURFACE = True
+
+
+# ============================================================================
+# BASIC I/O
+# ============================================================================
+
+
+def read_facenames(fname: str) -> dict[int, str]:
+    faces = {}
+    pattern = re.compile(r"set\s+gPolyDataFaceNames\((\d+)\)\s+(\S+)")
+
+    with open(fname, "r") as f:
+        for line in f:
+            m = pattern.match(line.strip())
+            if m:
+                fid = int(m.group(1))
+                name = m.group(2).strip().strip("{}")
+                faces[fid] = name
+
+    return faces
+
+
+
+def write_facenames(path: str, assignments: dict[int, str]) -> None:
+    with open(path, "w") as f:
+        f.write("global gPolyDataFaceNames\n\n")
+        for fid in sorted(assignments):
+            f.write(f"set gPolyDataFaceNames({fid}) {assignments[fid]}\n")
+
+
+
+def load_surface(path: str) -> pv.PolyData:
+    mesh = pv.read(path)
+    if not isinstance(mesh, pv.PolyData):
+        mesh = mesh.extract_surface()
+
+    mesh = mesh.triangulate()
+
+    # PyVista signatures have varied slightly between releases.
+    try:
+        mesh = mesh.clean(
+            point_merging=True,
+            tolerance=SURFACE_CLEAN_TOLERANCE,
+            absolute=True,
+        )
+    except TypeError:
+        mesh = mesh.clean(
+            point_merging=True,
+            tolerance=SURFACE_CLEAN_TOLERANCE,
+        )
+
+    return mesh
+
+
+# ============================================================================
+# INITIAL SIMVASCULAR FACE ASSIGNMENT
+# ============================================================================
+
+
+def extract_cap_info(
+    surface: pv.PolyData,
+    facename_file: str,
+    percentile: float = 95,
+):
+    """Extract planar cap descriptors from all non-wall reference faces."""
+
+    face_map = read_facenames(facename_file)
+
+    cap_entries = {
+        fid: name
+        for fid, name in face_map.items()
+        if "wall" not in name.lower()
+    }
+
+    wall_entries = {
+        fid: name
+        for fid, name in face_map.items()
+        if "wall" in name.lower()
+    }
+
+    if not cap_entries:
+        raise RuntimeError("No non-wall faces found in .facenames file.")
+
+    if "ModelFaceID" not in surface.cell_data:
+        raise RuntimeError("ModelFaceID cell data missing from BASE_VTP.")
+
+    mf_ids = np.asarray(surface.cell_data["ModelFaceID"]).astype(np.int64)
+    caps = []
+
+    for fid, name in sorted(cap_entries.items()):
+        cell_ids = np.where(mf_ids == fid)[0]
+
+        if len(cell_ids) == 0:
+            print(f"  WARNING: cap '{name}' (fid={fid}) has no cells; skipping")
+            continue
+
+        sub = surface.extract_cells(cell_ids).extract_surface()
+        pts = np.asarray(sub.points, dtype=float)
+
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        normal = vh[-1]
+        normal /= np.linalg.norm(normal)
+
+        vec = pts - centroid
+        signed_plane = vec @ normal
+        projected = vec - np.outer(signed_plane, normal)
+        radial_dist = np.linalg.norm(projected, axis=1)
+
+        radius = float(np.percentile(radial_dist, percentile))
+        plane_tol = max(radius * PLANE_TOL_FACTOR, 1.0e-12)
+
+        caps.append(
+            {
+                "fid": int(fid),
+                "name": str(name),
+                "centroid": centroid,
+                "normal": normal,
+                "radius": radius,
+                "plane_tol": plane_tol,
+            }
+        )
+
+        print(
+            f"  Cap '{name}' | fid={fid} | "
+            f"radius={radius:.6g} | plane_tol={plane_tol:.6g}"
+        )
+
+    # If the reference contains exactly one wall ID, preserve it.  Otherwise
+    # combine all unassigned result cells into one wall face.
+    if len(wall_entries) == 1:
+        wall_fid, wall_name = next(iter(wall_entries.items()))
+    else:
+        wall_fid = max(face_map.keys()) + 1
+        wall_name = "wall"
+        if len(wall_entries) > 1:
+            print(
+                "  WARNING: multiple wall names found in the reference. "
+                "RESULT_VTP will use one combined wall face."
+            )
+
+    return caps, int(wall_fid), str(wall_name)
+
+
+
+def assign_face_ids(
+    result_mesh: pv.PolyData,
+    caps,
+    wall_fid: int,
+    wall_name: str,
+):
+    """Stamp ModelFaceID onto RESULT_VTP using reference cap geometry."""
+
+    tri = result_mesh.triangulate()
+    faces = tri.faces.reshape(-1, 4)[:, 1:]
+    pts = np.asarray(tri.points, dtype=float)
+    cell_centroids = pts[faces].mean(axis=1)
+
+    face_id_array = np.zeros(tri.n_cells, dtype=np.int32)
+    best_score = np.full(tri.n_cells, np.inf, dtype=float)
+
+    for cap in caps:
+        centroid = cap["centroid"]
+        normal = cap["normal"]
+        radius = cap["radius"]
+        plane_tol = cap["plane_tol"]
+
+        vec = cell_centroids - centroid
+        signed = vec @ normal
+        plane_dist = np.abs(signed)
+        projected = vec - np.outer(signed, normal)
+        radial_dist = np.linalg.norm(projected, axis=1)
+
+        radial_limit = radius * CAP_RADIUS_ASSIGNMENT_FACTOR
+        mask = (plane_dist <= plane_tol) & (radial_dist <= radial_limit)
+
+        # Resolve rare overlaps deterministically by normalized distance.
+        score = (
+            plane_dist / max(plane_tol, 1.0e-15)
+            + radial_dist / max(radius, 1.0e-15)
+        )
+        update = mask & (score < best_score)
+        face_id_array[update] = int(cap["fid"])
+        best_score[update] = score[update]
+
+        n_assigned = int(np.count_nonzero(update))
+        status = "OK" if np.count_nonzero(mask) > 0 else "ZERO CELLS"
+        print(f"  Cap '{cap['name']}' -> {n_assigned} cells ({status})")
+
+    wall_mask = face_id_array == 0
+    face_id_array[wall_mask] = wall_fid
+    print(f"  Wall '{wall_name}' (fid={wall_fid}) -> {wall_mask.sum()} cells")
+
+    tri.cell_data["ModelFaceID"] = face_id_array
+
+    assignments = {int(c["fid"]): str(c["name"]) for c in caps}
+    assignments[int(wall_fid)] = wall_name
+
+    return tri, assignments
+
+
+# ============================================================================
+# SURFACE VALIDATION
+# ============================================================================
+
+
+def validate_closed_surface(surface: pv.PolyData) -> None:
+    print("\nValidating surface before Gmsh...")
+
+    if surface.n_points == 0 or surface.n_cells == 0:
+        raise RuntimeError("RESULT_VTP is empty.")
+
+    boundary = surface.extract_feature_edges(
+        boundary_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=False,
+    )
+    n_boundary_edges = boundary.n_cells
+
+    nonmanifold = surface.extract_feature_edges(
+        boundary_edges=False,
+        feature_edges=False,
+        manifold_edges=False,
+        non_manifold_edges=True,
+    )
+    n_nonmanifold_edges = nonmanifold.n_cells
+
+    print(f"  Boundary edges    : {n_boundary_edges}")
+    print(f"  Non-manifold edges: {n_nonmanifold_edges}")
+
+    if REQUIRE_WATERTIGHT_SURFACE and n_boundary_edges > 0:
+        raise RuntimeError(
+            "RESULT_VTP is open. Gmsh cannot create the intended vascular "
+            "volume from this surface. Use a capped/closed meshing copy."
+        )
+
+    if REQUIRE_MANIFOLD_SURFACE and n_nonmanifold_edges > 0:
+        raise RuntimeError(
+            "RESULT_VTP contains non-manifold edges. Repair these before "
+            "tetrahedralization."
+        )
+
+    if REQUIRE_SINGLE_CONNECTED_COMPONENT:
+        conn = surface.connectivity()
+        if "RegionId" in conn.cell_data:
+            region_ids = np.asarray(conn.cell_data["RegionId"])
+        elif "RegionId" in conn.point_data:
+            region_ids = np.asarray(conn.point_data["RegionId"])
+        else:
+            region_ids = np.array([0], dtype=int)
+
+        n_regions = len(np.unique(region_ids))
+        print(f"  Connected regions : {n_regions}")
+
+        if n_regions != 1:
+            raise RuntimeError(
+                f"RESULT_VTP has {n_regions} disconnected surface regions. "
+                "Expected exactly one connected PA lumen surface."
+            )
+
+
+# ============================================================================
+# GMSH VOLUME MESHING
+# ============================================================================
+
+
+def _int32_checked(values: np.ndarray, name: str) -> np.ndarray:
+    values = np.asarray(values, dtype=np.int64)
+    info = np.iinfo(np.int32)
+    if values.size and (values.min() < info.min or values.max() > info.max):
+        raise RuntimeError(f"{name} values exceed signed Int32 range.")
+    return values.astype(np.int32)
+
+
+
+def run_gmsh(stl_path: str, msh_path: str):
+    """Create a first-order tetrahedral mesh from the closed STL surface."""
+
+    gmsh.initialize()
+
+    try:
+        gmsh.option.setNumber("General.Terminal", 1 if GMSH_TERMINAL_OUTPUT else 0)
+        gmsh.model.add("pulmonary_artery")
+
+        gmsh.merge(stl_path)
+
+        angle = math.radians(GMSH_CLASSIFY_ANGLE_DEG)
+
+        # Standard Gmsh discrete-STL workflow: classify the triangulated
+        # surface, create parametrized discrete geometry, then create a volume
+        # bounded by all resulting surface entities.
+        gmsh.model.mesh.classifySurfaces(
+            angle,
+            True,   # create boundary curves if needed
+            True,   # split enough for reparametrization
+            math.pi,
+        )
+        gmsh.model.mesh.createGeometry()
+
+        surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
+        if not surface_tags:
+            raise RuntimeError("Gmsh created no discrete surface entities.")
+
+        surface_loop = gmsh.model.geo.addSurfaceLoop(surface_tags)
+        volume_tag = gmsh.model.geo.addVolume([surface_loop])
+        gmsh.model.geo.synchronize()
+
+        # Physical volume is useful if the .msh file is inspected elsewhere.
+        pg = gmsh.model.addPhysicalGroup(3, [volume_tag])
+        gmsh.model.setPhysicalName(3, pg, "fluid")
+
+        gmsh.option.setNumber("Mesh.Algorithm3D", float(GMSH_ALGORITHM_3D))
+        gmsh.option.setNumber("Mesh.ElementOrder", 1)
+        gmsh.option.setNumber("Mesh.SaveAll", 1)
+
+        if GMSH_MIN_SIZE is not None:
+            gmsh.option.setNumber("Mesh.MeshSizeMin", float(GMSH_MIN_SIZE))
+        if GMSH_MAX_SIZE is not None:
+            gmsh.option.setNumber("Mesh.MeshSizeMax", float(GMSH_MAX_SIZE))
+
+        print("\nGenerating Gmsh tetrahedral volume mesh...")
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(1)
+
+        if GMSH_OPTIMIZE_NETGEN:
+            print("Optimizing tetrahedra with Netgen optimizer...")
+            try:
+                gmsh.model.mesh.optimize("Netgen")
+            except Exception as exc:
+                print(f"  WARNING: Netgen optimization failed: {exc}")
+
+        if KEEP_GMSH_MSH:
+            gmsh.write(msh_path)
+
+        # ----------------------------
+        # Nodes
+        # ----------------------------
+        node_tags, coords, _ = gmsh.model.mesh.getNodes()
+        node_tags = np.asarray(node_tags, dtype=np.int64)
+        points = np.asarray(coords, dtype=float).reshape(-1, 3)
+
+        if len(node_tags) != len(points):
+            raise RuntimeError("Unexpected mismatch in Gmsh node arrays.")
+
+        # Fast tag -> row lookup. Gmsh tags are positive integers.
+        max_node_tag = int(node_tags.max()) if len(node_tags) else 0
+        tag_to_row = np.full(max_node_tag + 1, -1, dtype=np.int64)
+        tag_to_row[node_tags] = np.arange(len(node_tags), dtype=np.int64)
+
+        # ----------------------------
+        # 3D elements
+        # ----------------------------
+        element_types, element_tag_blocks, node_tag_blocks = (
+            gmsh.model.mesh.getElements(3)
+        )
+
+        tet_connectivity = []
+        tet_element_tags = []
+        unsupported = []
+
+        for etype, etags, enodes in zip(
+            element_types,
+            element_tag_blocks,
+            node_tag_blocks,
+        ):
+            etype = int(etype)
+            etags = np.asarray(etags, dtype=np.int64)
+            enodes = np.asarray(enodes, dtype=np.int64)
+
+            name, dim, order, n_nodes, _, n_primary = (
+                gmsh.model.mesh.getElementProperties(etype)
+            )
+
+            # Gmsh type 4 = 4-node first-order tetrahedron.
+            if etype != 4 or int(n_nodes) != 4 or int(order) != 1:
+                unsupported.append(
+                    (etype, str(name), len(etags), int(n_nodes), int(order))
+                )
+                continue
+
+            conn_tags = enodes.reshape(-1, 4)
+
+            if conn_tags.max(initial=0) > max_node_tag:
+                raise RuntimeError("A tetrahedron references an unknown Gmsh node tag.")
+
+            conn_rows = tag_to_row[conn_tags]
+            if np.any(conn_rows < 0):
+                raise RuntimeError("Could not map all tetrahedral node tags to coordinates.")
+
+            tet_connectivity.append(conn_rows)
+            tet_element_tags.append(etags)
+
+        if unsupported:
+            details = "; ".join(
+                f"type {t[0]} ({t[1]}): {t[2]} elements"
+                for t in unsupported
+            )
+            raise RuntimeError(
+                "Gmsh generated unsupported 3D element types. This exporter "
+                f"expects only first-order tetrahedra. Found: {details}"
+            )
+
+        if not tet_connectivity:
+            raise RuntimeError("Gmsh generated no tetrahedra.")
+
+        tets = np.vstack(tet_connectivity).astype(np.int64, copy=False)
+        tet_tags = np.concatenate(tet_element_tags).astype(np.int64, copy=False)
+
+        print(f"  Gmsh nodes       : {len(points)}")
+        print(f"  Gmsh tetrahedra  : {len(tets)}")
+
+        return points, node_tags, tets, tet_tags
+
+    finally:
+        gmsh.finalize()
+
+
+# ============================================================================
+# CONSTRUCT SIMVASCULAR VOLUME + BOUNDARY MESHES
+# ============================================================================
+
+
+def build_volume_grid(points, node_tags, tets, tet_tags) -> pv.UnstructuredGrid:
+    n_tets = len(tets)
+
+    cells = np.empty((n_tets, 5), dtype=np.int64)
+    cells[:, 0] = 4
+    cells[:, 1:] = tets
+
+    celltypes = np.full(n_tets, pv.CellType.TETRA, dtype=np.uint8)
+
+    grid = pv.UnstructuredGrid(
+        cells.ravel(),
+        celltypes,
+        np.asarray(points, dtype=float),
+    )
+
+    grid.point_data["GlobalNodeID"] = _int32_checked(node_tags, "GlobalNodeID")
+    grid.cell_data["GlobalElementID"] = _int32_checked(
+        tet_tags,
+        "GlobalElementID",
+    )
+    grid.cell_data["ModelRegionID"] = np.ones(n_tets, dtype=np.int32)
+
+    return grid
+
+
+
+def extract_boundary_faces(points, tets):
+    """
+    Return outward-oriented boundary triangle connectivity and owning tet rows.
+
+    A tetra face is on the exterior exactly when its unordered node triplet
+    occurs once among all tetrahedra.
+    """
+
+    # Each row is the face opposite local tet vertex 0,1,2,3 respectively.
+    face_lut = np.array(
+        [
+            [1, 2, 3],
+            [0, 2, 3],
+            [0, 1, 3],
+            [0, 1, 2],
+        ],
+        dtype=np.int64,
+    )
+
+    all_faces = tets[:, face_lut].reshape(-1, 3)
+    sorted_faces = np.sort(all_faces, axis=1)
+
+    _, first_idx, counts = np.unique(
+        sorted_faces,
+        axis=0,
+        return_index=True,
+        return_counts=True,
+    )
+
+    boundary_flat_idx = first_idx[counts == 1]
+    boundary_faces = all_faces[boundary_flat_idx].copy()
+    owner_tet_rows = boundary_flat_idx // 4
+    opposite_slots = boundary_flat_idx % 4
+    opposite_nodes = tets[owner_tet_rows, opposite_slots]
+
+    # Orient each triangle away from its owning tetrahedron interior.
+    p0 = points[boundary_faces[:, 0]]
+    p1 = points[boundary_faces[:, 1]]
+    p2 = points[boundary_faces[:, 2]]
+    popp = points[opposite_nodes]
+
+    normals = np.cross(p1 - p0, p2 - p0)
+    to_inside = popp - p0
+    points_inward = np.einsum("ij,ij->i", normals, to_inside) > 0.0
+
+    if np.any(points_inward):
+        tmp = boundary_faces[points_inward, 1].copy()
+        boundary_faces[points_inward, 1] = boundary_faces[points_inward, 2]
+        boundary_faces[points_inward, 2] = tmp
+
+    return boundary_faces, owner_tet_rows
+
+
+
+def transfer_model_face_ids(
+    labelled_surface: pv.PolyData,
+    points: np.ndarray,
+    boundary_faces: np.ndarray,
+) -> np.ndarray:
+    """Transfer ModelFaceID to Gmsh boundary triangles by nearest surface cell."""
+
+    if "ModelFaceID" not in labelled_surface.cell_data:
+        raise RuntimeError("Labelled input surface has no ModelFaceID array.")
+
+    centroids = points[boundary_faces].mean(axis=1)
+
+    # PyVista delegates this to a VTK cell locator and supports batched points.
+    try:
+        closest_ids, closest_points = labelled_surface.find_closest_cell(
+            centroids,
+            return_closest_point=True,
+        )
+        closest_ids = np.asarray(closest_ids, dtype=np.int64)
+        closest_points = np.asarray(closest_points, dtype=float)
+        distances = np.linalg.norm(centroids - closest_points, axis=1)
+    except TypeError:
+        # Compatibility with older PyVista releases.
+        closest_ids = np.asarray(
+            labelled_surface.find_closest_cell(centroids),
+            dtype=np.int64,
+        )
+        distances = None
+
+    source_face_ids = np.asarray(
+        labelled_surface.cell_data["ModelFaceID"],
+        dtype=np.int32,
+    )
+    model_face_ids = source_face_ids[closest_ids]
+
+    if distances is not None and len(distances):
+        bounds = labelled_surface.bounds
+        diag = math.sqrt(
+            (bounds[1] - bounds[0]) ** 2
+            + (bounds[3] - bounds[2]) ** 2
+            + (bounds[5] - bounds[4]) ** 2
+        )
+        warn_dist = diag * FACE_TRANSFER_WARN_FRACTION_OF_BBOX
+        max_dist = float(distances.max())
+        n_far = int(np.count_nonzero(distances > warn_dist))
+
+        print(f"  Max boundary->source transfer distance: {max_dist:.6g}")
+        if n_far:
+            print(
+                f"  WARNING: {n_far} boundary triangles are farther than "
+                f"{warn_dist:.6g} from the labelled source surface."
+            )
+
+    return model_face_ids.astype(np.int32, copy=False)
+
+
+
+def make_boundary_polydata(
+    points,
+    global_node_ids,
+    faces,
+    owner_global_element_ids,
+    model_face_ids,
+    mask=None,
+) -> pv.PolyData:
+    """Create a compact VTP surface while preserving volume GlobalNodeID."""
+
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        faces = faces[mask]
+        owner_global_element_ids = owner_global_element_ids[mask]
+        model_face_ids = model_face_ids[mask]
+
+    if len(faces) == 0:
+        return pv.PolyData()
+
+    unique_rows, inverse = np.unique(faces.ravel(), return_inverse=True)
+    local_faces = inverse.reshape(-1, 3)
+
+    vtk_faces = np.empty((len(local_faces), 4), dtype=np.int64)
+    vtk_faces[:, 0] = 3
+    vtk_faces[:, 1:] = local_faces
+
+    poly = pv.PolyData(
+        points[unique_rows],
+        vtk_faces.ravel(),
+    )
+
+    poly.point_data["GlobalNodeID"] = _int32_checked(
+        global_node_ids[unique_rows],
+        "surface GlobalNodeID",
+    )
+    poly.cell_data["GlobalElementID"] = _int32_checked(
+        owner_global_element_ids,
+        "surface GlobalElementID",
+    )
+    poly.cell_data["ModelFaceID"] = np.asarray(
+        model_face_ids,
+        dtype=np.int32,
+    )
+
+    return poly
+
+
+
+def safe_face_filename(name: str, fid: int) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    clean = clean.strip("._")
+    if not clean:
+        clean = f"face_{fid}"
+    return clean + ".vtp"
+
+
+
+def write_mesh_complete(
+    mesh_complete_dir: str,
+    volume_grid: pv.UnstructuredGrid,
+    labelled_surface: pv.PolyData,
+    assignments: dict[int, str],
+    points: np.ndarray,
+    node_tags: np.ndarray,
+    tets: np.ndarray,
+    tet_tags: np.ndarray,
+):
+    outdir = Path(mesh_complete_dir)
+    face_dir = outdir / "mesh-surfaces"
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    if face_dir.exists():
+        shutil.rmtree(face_dir)
+    face_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\nExtracting tetrahedral exterior surface...")
+    boundary_faces, owner_rows = extract_boundary_faces(points, tets)
+    owner_element_ids = tet_tags[owner_rows]
+
+    print(f"  Boundary triangles: {len(boundary_faces)}")
+
+    print("Transferring ModelFaceID onto Gmsh boundary triangles...")
+    boundary_face_ids = transfer_model_face_ids(
+        labelled_surface,
+        points,
+        boundary_faces,
+    )
+
+    unknown = sorted(set(np.unique(boundary_face_ids)) - set(assignments.keys()))
+    if unknown:
+        raise RuntimeError(
+            "Boundary transfer produced ModelFaceID values not present in "
+            f"the assignments map: {unknown}"
+        )
+
+    exterior = make_boundary_polydata(
+        points,
+        node_tags,
+        boundary_faces,
+        owner_element_ids,
+        boundary_face_ids,
+    )
+
+    volume_path = outdir / "mesh-complete.mesh.vtu"
+    exterior_path = outdir / "mesh-complete.exterior.vtp"
+    walls_path = outdir / "walls_combined.vtp"
+
+    volume_grid.save(str(volume_path))
+    exterior.save(str(exterior_path))
+
+    print("\nWriting mesh-surfaces...")
+
+    used_names = set()
+    wall_mask_total = np.zeros(len(boundary_faces), dtype=bool)
+
+    for fid in sorted(assignments):
+        name = assignments[fid]
+        mask = boundary_face_ids == int(fid)
+        n_cells = int(np.count_nonzero(mask))
+
+        if n_cells == 0:
+            print(f"  WARNING: face '{name}' (fid={fid}) has zero Gmsh boundary cells")
+            continue
+
+        filename = safe_face_filename(name, fid)
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+
+        if filename.lower() in used_names:
+            filename = f"{stem}_fid{fid}{suffix}"
+        used_names.add(filename.lower())
+
+        face_poly = make_boundary_polydata(
+            points,
+            node_tags,
+            boundary_faces,
+            owner_element_ids,
+            boundary_face_ids,
+            mask,
+        )
+        face_poly.save(str(face_dir / filename))
+
+        if "wall" in name.lower():
+            wall_mask_total |= mask
+
+        print(f"  {filename:<40} fid={fid:<5} cells={n_cells}")
+
+    if not np.any(wall_mask_total):
+        raise RuntimeError(
+            "No wall-labelled boundary triangles were produced; cannot write "
+            "walls_combined.vtp."
+        )
+
+    walls = make_boundary_polydata(
+        points,
+        node_tags,
+        boundary_faces,
+        owner_element_ids,
+        boundary_face_ids,
+        wall_mask_total,
+    )
+    walls.save(str(walls_path))
+
+    # Final consistency checks that matter for SimVascular.
+    volume_global_nodes = set(
+        np.asarray(volume_grid.point_data["GlobalNodeID"], dtype=np.int64).tolist()
+    )
+    exterior_global_nodes = set(
+        np.asarray(exterior.point_data["GlobalNodeID"], dtype=np.int64).tolist()
+    )
+
+    missing_nodes = exterior_global_nodes - volume_global_nodes
+    if missing_nodes:
+        raise RuntimeError(
+            f"Exterior mesh references {len(missing_nodes)} GlobalNodeID values "
+            "not present in the volume mesh."
+        )
+
+    print("\nSimVascular mesh-complete written successfully:")
+    print(f"  {outdir}")
+    print(f"  Volume nodes      : {volume_grid.n_points}")
+    print(f"  Volume tetrahedra : {volume_grid.n_cells}")
+    print(f"  Exterior triangles: {exterior.n_cells}")
+    print(f"  Face files        : {len(list(face_dir.glob('*.vtp')))}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+
+def main():
+    print("=" * 72)
+    print("CAP ASSIGNMENT -> GMSH -> SIMVASCULAR MESH-COMPLETE")
+    print("=" * 72)
+
+    for path_name, path in (
+        ("BASE_VTP", BASE_VTP),
+        ("OLD_FACENAMES", OLD_FACENAMES),
+        ("RESULT_VTP", RESULT_VTP),
+    ):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{path_name} does not exist: {path}")
+
+    output_parent = Path(MESH_COMPLETE_DIR)
+    output_parent.mkdir(parents=True, exist_ok=True)
+
+    print("\nLoading surfaces...")
+    base = load_surface(BASE_VTP)
+    result = load_surface(RESULT_VTP)
+    print(f"  Base   : {base.n_points} points | {base.n_cells} triangles")
+    print(f"  Result : {result.n_points} points | {result.n_cells} triangles")
+
+    print("\nExtracting reference cap geometry...")
+    caps, wall_fid, wall_name = extract_cap_info(
+        base,
+        OLD_FACENAMES,
+        percentile=CAP_PERCENTILE,
+    )
+    print(f"  Detected caps: {len(caps)}")
+
+    print("\nAssigning ModelFaceID to RESULT_VTP...")
+    labelled, assignments = assign_face_ids(
+        result,
+        caps,
+        wall_fid,
+        wall_name,
+    )
+
+    labelled.save(OUTPUT_VTP)
+    write_facenames(OUTPUT_FACENAMES, assignments)
+    print(f"  Labelled surface: {OUTPUT_VTP}")
+    print(f"  Facenames       : {OUTPUT_FACENAMES}")
+
+    validate_closed_surface(labelled)
+
+    # Orient normals for a closed surface before STL export.  Gmsh generally
+    # handles STL orientation well, but consistent normals reduce ambiguity.
+    try:
+        gmsh_surface = labelled.compute_normals(
+            cell_normals=True,
+            point_normals=False,
+            split_vertices=False,
+            consistent_normals=True,
+            auto_orient_normals=True,
+            inplace=False,
+        )
+    except TypeError:
+        gmsh_surface = labelled.compute_normals(
+            cell_normals=True,
+            point_normals=False,
+            consistent_normals=True,
+            auto_orient_normals=True,
+            inplace=False,
+        )
+
+    stl_path = str(output_parent / GMSH_STL_NAME)
+    msh_path = str(output_parent / GMSH_MSH_NAME)
+
+    print(f"\nWriting temporary Gmsh surface: {stl_path}")
+    gmsh_surface.save(stl_path)
+
+    points, node_tags, tets, tet_tags = run_gmsh(
+        stl_path,
+        msh_path,
+    )
+
+    print("\nBuilding SimVascular volume mesh arrays...")
+    volume_grid = build_volume_grid(
+        points,
+        node_tags,
+        tets,
+        tet_tags,
+    )
+
+    write_mesh_complete(
+        MESH_COMPLETE_DIR,
+        volume_grid,
+        labelled,
+        assignments,
+        points,
+        node_tags,
+        tets,
+        tet_tags,
+    )
+
+    if not KEEP_GMSH_STL:
+        try:
+            os.remove(stl_path)
+        except OSError:
+            pass
+
+    print("\nFinal face assignments:")
+    for fid in sorted(assignments):
+        print(f"  ModelFaceID={fid:<5} -> {assignments[fid]}")
+
+    print("\nDONE")
+    print(
+        "In SimVascular MultiPhysics, use 'Add Mesh-Complete' and select:\n"
+        f"  {MESH_COMPLETE_DIR}"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print("\nERROR:")
+        print(exc)
+        raise
