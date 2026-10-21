@@ -3,8 +3,9 @@ import os
 import math
 from collections import defaultdict
 
-# Refinement version: exact VTK clipping + permissive retry/skip +
-# local cross-section area/shape QC for detecting mangled branch-like caps.
+# Final refinement: exact VTK clipping + permissive retry/skip +
+# local cross-section shape QC + near-cut triangle-spike QC + open-only
+# mesh-quality cleanup output.
 
 # Refinement: every local cut can retry at nearby positions along its
 # associated centerline branch. In exploratory/permissive mode, a cut that
@@ -16,37 +17,37 @@ from collections import defaultdict
 # ============================================================
 
 # Full, untrimmed centerline tree.
-FULL_CENTERLINE_FILE = r"C:\path\to\Network_model_V2.vtp"
+FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Network_model_V2.vtp"
 
 # Centerline tree after trimming to the extent you want to keep.
-TRIMMED_CENTERLINE_FILE = r"C:\path\to\JL_Centerline_mini-cut.vtp"
+TRIMMED_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Centerline_Trimmed.vtp"
 
 # Original pulmonary artery surface to prune.
-SURFACE_FILE = r"C:\path\to\Pulmonary_Artery_Surface.vtp"
+SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\pulmonary_artery_1.vtp"
 
 # Exact-clipped PA tree with the new outlet rings left OPEN.
 # This is the most useful QC output because you can inspect the new
 # plane-cut boundary before any cap is added.
-OUTPUT_OPEN_FILE = r"C:\path\to\Pulmonary_Artery_Surface_Pruned_Exact_Open.vtp"
+OUTPUT_OPEN_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Pruned_Exact_Open.vtp"
 
 # Exact-clipped PA tree with flat triangulated caps added at the new cuts.
-OUTPUT_CAPPED_FILE = r"C:\path\to\Pulmonary_Artery_Surface_Pruned_Exact_Capped.vtp"
+OUTPUT_CAPPED_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Pruned_Exact_Capped.vtp"
 
 # Debug output: the intended circular search/QC disk for every cut.
-CUTS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Cuts_Debug.vtp"
+CUTS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Cuts_Debug.vtp"
 
 # Debug output: the ACTUAL plane/surface intersection loop selected for
 # every cut. These should look like clean oval/circular outlet rings.
-CUT_LOOPS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Exact_Cut_Loops_Debug.vtp"
+CUT_LOOPS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Exact_Cut_Loops_Debug.vtp"
 
 # Debug output: after all exact cuts, but BEFORE connectivity removes the
 # detached distal vessel pieces.
-SEVERED_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Exact_Severed_Debug.vtp"
+SEVERED_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Exact_Severed_Debug.vtp"
 
 # Debug output: intended cutting circles for EVERY failed/rejected retry
 # position. Load this together with the centerlines/surface to see exactly
 # where the script was unhappy without stopping the rest of the run.
-FAILED_CUT_ATTEMPTS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp"
+FAILED_CUT_ATTEMPTS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp"
 
 
 # ============================================================
@@ -92,7 +93,24 @@ PARENTWARD_RETRY_RADIUS_OFFSETS = (
      1.00,
      1.50,
      2.00,
-    -0.25,
+    -1.25,
+    -3.50,
+    -5.00
+)
+
+# True IsOutlet points get a MUCH more aggressive parentward search.
+# These values are expressed in local vessel radii measured from the
+# originally requested IsOutlet plane.  Positive values move farther
+# upstream toward the parent branch.  This is intentionally about 10x
+# larger than the earlier retry spacing so a problematic distal tip/cap
+# does not cause every retry plane to land in essentially the same place.
+OUTLET_PARENTWARD_RETRY_RADIUS_OFFSETS = (
+     2.50,
+     5.00,
+     7.50,
+    10.00,
+    15.00,
+    20.00,
     -0.50,
     -1.00
 )
@@ -105,7 +123,7 @@ SIDE_BRANCH_RETRY_RADIUS_OFFSETS = (
      1.50,
      2.00,
     -0.25,
-    -0.50
+    -1.50
 )
 
 # Never move an alternate plane beyond this fraction of the source polyline
@@ -139,7 +157,7 @@ MAX_LOOP_AREA_TO_EXPECTED_RATIO = 3.50
 
 # Circularity = 4*pi*A / P^2. A circle is 1.0; a normal oval is lower but
 # should still be well above a strongly branched/lopsided contour.
-MIN_LOOP_CIRCULARITY = 0.30
+MIN_LOOP_CIRCULARITY = 0.40
 
 # Shape radii are measured from the loop's own point-centroid (not from the
 # centerline), making this sensitive to a one-sided protrusion while allowing
@@ -176,7 +194,7 @@ TERMINAL_OFFSET_FRACTION = 0.0
 #
 # A modest positive value is usually preferable because it removes the old
 # distal tip/cap and leaves a real vessel cross-section for the exact VTK cut.
-OUTLET_OFFSET_FRACTION = 0.50
+OUTLET_OFFSET_FRACTION = 0.75
 
 # For IsOutlet cuts only: after vtkCutter finds the closest plane/surface
 # contour, require that contour to be reasonably local to the centerline
@@ -218,6 +236,39 @@ REGENERATE_GLOBAL_IDS = True
 
 
 # ============================================================
+# LOCAL NEAR-CUT SINGLE-TRIANGLE SPIKE QC
+# ============================================================
+#
+# The global Mesh Quality cleanup catches gross bad elements after the
+# model is finished, but a newly created outlet can sometimes leave one
+# isolated triangle sticking out beside an otherwise acceptable oval cut.
+#
+# Before accepting each candidate cut, inspect the retained-side triangles
+# immediately around that new opening.  If a triangle is exceptionally
+# skinny/long or has one vertex protruding well outside the expected local
+# vessel radius, reject that cut location and let the existing retry logic
+# move the plane farther along the centerline.
+ENABLE_NEAR_CUT_SPIKE_QC = True
+
+# Approximate number of local mesh rings to inspect around the cut.
+# This is implemented geometrically using an axial window sized from the
+# local radius, which is more stable than relying on VTK cell IDs after clip.
+NEAR_CUT_SPIKE_CELL_RINGS = 2
+
+# Conservative local thresholds.  These are intentionally much tighter than
+# the final global 1e5/1e6-type failure threshold because here we are trying
+# to prevent an obviously malformed cap neighborhood before accepting it.
+NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD = 50.0
+NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS = 1.75
+NEAR_CUT_SPIKE_MAX_EDGE_RATIO = 8.0
+
+# Detect the classic single-vertex "spike": one triangle vertex lies far
+# outside the local vessel radius while the other two remain near the vessel.
+NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR = 1.80
+NEAR_CUT_SPIKE_RADIAL_INNER_FACTOR = 1.25
+
+
+# ============================================================
 # FINAL MESH-QUALITY / SPIKE CLEANUP SETTINGS
 # ============================================================
 #
@@ -239,7 +290,7 @@ REGENERATE_GLOBAL_IDS = True
 ENABLE_MESH_QUALITY_CLEANUP = True
 
 # SimVascular meshing failure threshold requested for this workflow.
-MESH_QUALITY_THRESHOLD = 1.0e6
+MESH_QUALITY_THRESHOLD = 1.0e5
 
 # ParaView/VTK Mesh Quality supports several triangle measures.  "AspectRatio"
 # is used here because very skinny/sliver triangles become very large.
@@ -250,7 +301,10 @@ MESH_QUALITY_TRIANGLE_MEASURE = "AspectRatio"
 # Run the cleanup on the capped model when caps are being written, because
 # cap generation itself can create a rare bad triangle. If capped output is
 # disabled, the cleanup automatically uses the final open surface instead.
-MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE = True
+# The final quality-cleaned model is intentionally generated from the OPEN
+# surface only.  The capped model is still written separately for inspection,
+# but caps are never fed into OUTPUT_QUALITY_CLEANED_FILE.
+MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE = False
 
 # Oriented removal box dimensions.  These are HALF-widths expressed as
 # multiples of the local centerline Radius.
@@ -272,20 +326,20 @@ QUALITY_BOX_MERGE_DISTANCE_FACTOR = 1.25
 # A single cleanup pass is intentionally conservative.  The script reports
 # any Quality > threshold cells that remain afterward so they can be inspected
 # before deciding whether a second pass is desirable.
-MESH_QUALITY_CLEANUP_PASSES = 1
+MESH_QUALITY_CLEANUP_PASSES = 2
 
 # Final open output after bad-element boxes have been clipped away.  This is
 # intentionally OPEN at any quality-cleanup locations.
-OUTPUT_QUALITY_CLEANED_FILE = r"C:\path\to\Pulmonary_Artery_Surface_Quality_Cleaned_Open.vtp"
+OUTPUT_QUALITY_CLEANED_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Quality_Cleaned_Open.vtp"
 
 # Debug: all cells above MESH_QUALITY_THRESHOLD BEFORE cleanup.
-BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Bad_Quality_Cells_Debug.vtp"
+BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Bad_Quality_Cells_Debug.vtp"
 
 # Debug: oriented boxes actually used for quality cleanup.
-QUALITY_BOXES_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Quality_Clip_Boxes_Debug.vtp"
+QUALITY_BOXES_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Quality_Clip_Boxes_Debug.vtp"
 
 # Debug: any cells still above threshold AFTER the cleanup pass(es).
-REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\path\to\Pulmonary_Artery_Remaining_Bad_Quality_Cells_Debug.vtp"
+REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Remaining_Bad_Quality_Cells_Debug.vtp"
 
 
 # ============================================================
@@ -463,6 +517,22 @@ def triangulate_polydata(polydata):
     out.DeepCopy(tri.GetOutput())
 
     return out
+
+
+
+def count_boundary_edges(polydata):
+
+    feature_edges = vtk.vtkFeatureEdges()
+    feature_edges.SetInputData(polydata)
+    feature_edges.BoundaryEdgesOn()
+    feature_edges.FeatureEdgesOff()
+    feature_edges.NonManifoldEdgesOff()
+    feature_edges.ManifoldEdgesOff()
+    feature_edges.Update()
+
+    return int(
+        feature_edges.GetOutput().GetNumberOfCells()
+    )
 
 
 # ============================================================
@@ -689,7 +759,9 @@ def build_cut_retry_candidates(
     candidates = []
     used_distances = [base_distance]
 
-    if base_cut.get("type") in ("terminal", "outlet"):
+    if base_cut.get("type") == "outlet":
+        retry_offsets = OUTLET_PARENTWARD_RETRY_RADIUS_OFFSETS
+    elif base_cut.get("type") == "terminal":
         retry_offsets = PARENTWARD_RETRY_RADIUS_OFFSETS
     else:
         retry_offsets = SIDE_BRANCH_RETRY_RADIUS_OFFSETS
@@ -2205,6 +2277,260 @@ def build_flat_cap(loop):
     return cap
 
 
+
+# ============================================================
+# LOCAL NEAR-CUT SPIKE CHECK
+# ============================================================
+
+def triangle_edge_lengths(surface, cell_id):
+
+    cell = surface.GetCell(cell_id)
+
+    if cell is None or cell.GetNumberOfPoints() != 3:
+        return None
+
+    p0 = point_tuple(surface, cell.GetPointId(0))
+    p1 = point_tuple(surface, cell.GetPointId(1))
+    p2 = point_tuple(surface, cell.GetPointId(2))
+
+    lengths = [
+        distance(p0, p1),
+        distance(p1, p2),
+        distance(p2, p0)
+    ]
+
+    lengths.sort()
+
+    return lengths, (p0, p1, p2)
+
+
+def triangle_area_from_points(p0, p1, p2):
+
+    a = vec_sub(p1, p0)
+    b = vec_sub(p2, p0)
+    return 0.5 * magnitude(cross(a, b))
+
+
+def check_near_cut_single_triangle_spikes(surface, cut, plane):
+
+    if not ENABLE_NEAR_CUT_SPIKE_QC:
+        return {
+            "near_cut_cells_checked": 0,
+            "near_cut_spike_cells": 0
+        }
+
+    local_radius = float(cut.get("radius", 0.0))
+
+    if (
+        not math.isfinite(local_radius)
+        or local_radius <= PLANE_EPS
+    ):
+        return {
+            "near_cut_cells_checked": 0,
+            "near_cut_spike_cells": 0
+        }
+
+    # Inspect only a compact retained-side neighborhood around the new cut.
+    # One "ring" is approximated as roughly half a local radius axially.
+    axial_depth = (
+        max(1, int(NEAR_CUT_SPIKE_CELL_RINGS))
+        * 0.50
+        * local_radius
+    )
+
+    radial_search = (
+        max(
+            NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR,
+            NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
+        )
+        * local_radius
+        * 1.15
+    )
+
+    center = cut["center"]
+
+    bounds = (
+        center[0] - radial_search,
+        center[0] + radial_search,
+        center[1] - radial_search,
+        center[1] + radial_search,
+        center[2] - radial_search,
+        center[2] + radial_search
+    )
+
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(surface)
+    locator.BuildLocator()
+
+    candidate_ids = vtk.vtkIdList()
+    locator.FindCellsWithinBounds(bounds, candidate_ids)
+
+    checked = 0
+    spike_ids = []
+    worst_reason = None
+
+    for i in range(candidate_ids.GetNumberOfIds()):
+
+        cell_id = int(candidate_ids.GetId(i))
+
+        edge_data = triangle_edge_lengths(
+            surface,
+            cell_id
+        )
+
+        if edge_data is None:
+            continue
+
+        lengths, pts = edge_data
+        min_edge, mid_edge, max_edge = lengths
+
+        if min_edge <= PLANE_EPS:
+            spike_ids.append(cell_id)
+            worst_reason = (
+                "near-cut triangle has a numerically zero-length edge"
+            )
+            continue
+
+        centroid = (
+            (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0,
+            (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0,
+            (pts[0][2] + pts[1][2] + pts[2][2]) / 3.0
+        )
+
+        signed_centroid = float(
+            plane.EvaluateFunction(centroid)
+        )
+
+        # We only care about the retained/proximal side near the new opening.
+        if (
+            signed_centroid > PLANE_EPS
+            or signed_centroid < -axial_depth
+        ):
+            continue
+
+        centroid_radial = distance_from_axis(
+            centroid,
+            center,
+            cut["normal"]
+        )
+
+        if centroid_radial > radial_search:
+            continue
+
+        checked += 1
+
+        p0, p1, p2 = pts
+        area = triangle_area_from_points(
+            p0,
+            p1,
+            p2
+        )
+
+        # A simple dimensionless triangle aspect indicator.  For an
+        # equilateral triangle this is 1.0; it grows rapidly for slivers.
+        # aspect ~= max_edge^2 / (4*sqrt(3)*Area)
+        if area <= PLANE_EPS:
+            aspect_indicator = float("inf")
+        else:
+            aspect_indicator = (
+                max_edge * max_edge
+                / (4.0 * math.sqrt(3.0) * area)
+            )
+
+        edge_ratio = (
+            max_edge / min_edge
+        )
+
+        max_edge_to_radius = (
+            max_edge / local_radius
+        )
+
+        vertex_radials = [
+            distance_from_axis(
+                p,
+                center,
+                cut["normal"]
+            )
+            for p in pts
+        ]
+
+        vertex_radials.sort()
+
+        one_vertex_spike = (
+            vertex_radials[2]
+            > NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR * local_radius
+            and vertex_radials[1]
+            < NEAR_CUT_SPIKE_RADIAL_INNER_FACTOR * local_radius
+        )
+
+        reasons = []
+
+        if (
+            aspect_indicator
+            > NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD
+        ):
+            reasons.append(
+                "local triangle aspect indicator {:.3g} > {:.3g}"
+                .format(
+                    aspect_indicator,
+                    NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD
+                )
+            )
+
+        if (
+            max_edge_to_radius
+            > NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
+        ):
+            reasons.append(
+                "longest edge/local radius {:.3f} > {:.3f}"
+                .format(
+                    max_edge_to_radius,
+                    NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
+                )
+            )
+
+        if (
+            edge_ratio
+            > NEAR_CUT_SPIKE_MAX_EDGE_RATIO
+        ):
+            reasons.append(
+                "triangle edge ratio {:.3f} > {:.3f}"
+                .format(
+                    edge_ratio,
+                    NEAR_CUT_SPIKE_MAX_EDGE_RATIO
+                )
+            )
+
+        if one_vertex_spike:
+            reasons.append(
+                "one vertex protrudes {:.3f} local radii while the other "
+                "vertices remain near the vessel"
+                .format(
+                    vertex_radials[2] / local_radius
+                )
+            )
+
+        if reasons:
+            spike_ids.append(cell_id)
+            worst_reason = "; ".join(reasons)
+
+    if len(spike_ids) > 0:
+        raise SuspiciousCutLoop(
+            "Near-cut single-triangle spike QC rejected this location: "
+            "{} suspect triangle(s) among {} local triangle(s) checked. {}"
+            .format(
+                len(spike_ids),
+                checked,
+                worst_reason if worst_reason is not None else ""
+            )
+        )
+
+    return {
+        "near_cut_cells_checked": checked,
+        "near_cut_spike_cells": 0
+    }
+
+
 # ============================================================
 # EXACT LOCAL PLANE CUT
 #
@@ -2310,6 +2636,17 @@ def apply_exact_local_plane_cut(surface, cut):
 
     # Remove the internal selection flag before the next cut iteration.
     result.GetCellData().RemoveArray("__TargetCutCell")
+
+    # Reject an otherwise acceptable cut if the newly retained opening has
+    # an isolated sliver/spike triangle immediately beside it.  Raising
+    # SuspiciousCutLoop is intentional: apply_cut_with_retries() will simply
+    # try the next centerline location instead of modifying the surface.
+    near_cut_stats = check_near_cut_single_triangle_spikes(
+        result,
+        cut,
+        plane
+    )
+    stats.update(near_cut_stats)
 
     cap = build_flat_cap(loop)
 
@@ -3702,6 +4039,11 @@ for cut_index, cut in enumerate(pruning_cuts):
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
         )
+        if "near_cut_cells_checked" in stats:
+            print(
+                "    Near-cut triangles checked for isolated spikes:",
+                stats["near_cut_cells_checked"]
+            )
         if stats.get("retry_attempt", 0) > 0:
             print(
                 "    Accepted retry attempt:",
@@ -3858,6 +4200,11 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             "    Loop centroid offset from centerline:",
             stats["centroid_offset"]
         )
+        if "near_cut_cells_checked" in stats:
+            print(
+                "    Near-cut triangles checked for isolated spikes:",
+                stats["near_cut_cells_checked"]
+            )
         if stats.get("retry_attempt", 0) > 0:
             print(
                 "    Accepted retry attempt:",
@@ -4053,8 +4400,9 @@ print(OUTPUT_OPEN_FILE)
 # refined open surface.
 # ============================================================
 
-# Default quality-cleanup input is the final open surface.  If a capped
-# surface is created below, this variable is replaced by the capped model.
+# The final quality-cleaned model MUST remain open.  Always run the
+# mesh-quality cleanup from final_open.  The capped model below is a separate
+# optional deliverable and is never allowed to replace this input.
 quality_cleanup_input = final_open
 
 if WRITE_CAPPED_OUTPUT:
@@ -4145,8 +4493,9 @@ if WRITE_CAPPED_OUTPUT:
     )
     print(OUTPUT_CAPPED_FILE)
 
-    if MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE:
-        quality_cleanup_input = final_capped_with_normals
+    # Intentionally do NOT use final_capped_with_normals for mesh-quality
+    # cleanup. OUTPUT_QUALITY_CLEANED_FILE is required to preserve the open
+    # outlet boundaries from final_open.
 
 
 # ============================================================
@@ -4237,6 +4586,10 @@ if ENABLE_MESH_QUALITY_CLEANUP:
     print(
         "Remaining cells above quality threshold:",
         remaining_bad_quality_count
+    )
+    print(
+        "Open boundary edges in quality-cleaned output:",
+        count_boundary_edges(final_quality_cleaned_with_normals)
     )
     print(OUTPUT_QUALITY_CLEANED_FILE)
 
