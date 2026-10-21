@@ -15,23 +15,23 @@ from time import perf_counter
 # ============================================================
 # USER SETTINGS
 # ============================================================
-
+File_location = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_9-gen-test"
 # Full, untrimmed centerline tree.
-FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Network_model_V2.vtp"
+FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_4-gen-test\Network_model_V2.vtp"
 
 # Centerline tree after trimming to the extent you want to keep.
-TRIMMED_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Centerline_Trimmed.vtp"
+TRIMMED_CENTERLINE_FILE = File_location + "\JL_9-gen-centerlines.vtp"
 
 # Original pulmonary artery surface to prune.
-SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Full_Tree_Meshed.vtp"
+SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_4-gen-test\JL_Full_Tree_Meshed.vtp"
 
 # Exact-clipped PA tree with the new outlet rings left OPEN.
 # This is the most useful QC output because you can inspect the new
 # plane-cut boundary before any cap is added.
-OUTPUT_OPEN_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Pruned_Exact_Open.vtp"
+OUTPUT_OPEN_FILE = File_location + "\Pulmonary_Artery_Surface_Pruned_Exact_Open.vtp"
 
 # Exact-clipped PA tree with flat triangulated caps added at the new cuts.
-OUTPUT_CAPPED_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Pruned_Exact_Capped.vtp"
+OUTPUT_CAPPED_FILE = File_location + "\Pulmonary_Artery_Surface_Pruned_Exact_Capped.vtp"
 
 # Matching SimVascular face-name file written beside the FINAL capped model.
 # Format is intentionally the same as the supplied .vtp.facenames example:
@@ -42,14 +42,30 @@ OUTPUT_CAPPED_FACENAMES = OUTPUT_CAPPED_FILE + ".facenames"
 
 # Debug copy of the final boundary loops that are capped after ALL clipping
 # and mesh-quality cleanup has finished.
-FINAL_CAP_LOOPS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Final_Cap_Loops_Debug.vtp"
+FINAL_CAP_LOOPS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Final_Cap_Loops_Debug.vtp"
 
 # Build caps only after the final endpoint-box and quality-cleanup passes.
 # This is deliberately different from the older workflow, which capped the
 # pre-cleanup cut loops and could therefore create caps that no longer matched
 # the actual final opening.
 FINAL_CAP_WALL_FACE_ID = 1
-FINAL_CAP_FACE_NAME_PREFIX = "noname_"
+
+# Face 2 is reserved for the inlet, regardless of its Sidedness.
+FINAL_CAP_INLET_NAME = "INLET"
+
+# The trimmed centerline should carry PointData Sidedness as a vtkStringArray
+# (or another array with string-like values) containing Left, Right, or any
+# third category. Any other/missing value is called Other.
+SIDEDNESS_ARRAY = "Sidedness"
+LEFT_CAP_PREFIX = "Left"
+RIGHT_CAP_PREFIX = "Right"
+OTHER_CAP_PREFIX = "Other"
+# False: still run with older centerline files; unmatched caps become Other#.
+REQUIRE_SIDEDNESS_ARRAY = False
+
+# The loop closest to the accepted inlet cut MUST be close enough to really
+# be that new inlet opening. Do not silently rename some distant outlet INLET.
+INLET_CAP_MAX_DISTANCE_RADII = 3.0
 
 # Radial-ring caps avoid the long polygon diagonals / tiny ear-clipping slivers
 # that can appear with vtkContourTriangulator on large irregular loops.
@@ -61,20 +77,33 @@ FINAL_CAP_INTERIOR_RINGS = 2
 FINAL_CAP_EDGE_RATIO_WARN = 25.0
 
 # Debug output: the intended circular search/QC disk for every cut.
-CUTS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Cuts_Debug.vtp"
+CUTS_DEBUG_FILE = File_location  + "\Pulmonary_Artery_Cuts_Debug.vtp"
 
 # Debug output: the ACTUAL plane/surface intersection loop selected for
 # every cut. These should look like clean oval/circular outlet rings.
-CUT_LOOPS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Exact_Cut_Loops_Debug.vtp"
+CUT_LOOPS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Exact_Cut_Loops_Debug.vtp"
 
 # Debug output: after all exact cuts, but BEFORE connectivity removes the
 # detached distal vessel pieces.
-SEVERED_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Exact_Severed_Debug.vtp"
+SEVERED_DEBUG_FILE = File_location + "\Pulmonary_Artery_Exact_Severed_Debug.vtp"
 
 # Debug output: intended cutting circles for EVERY failed/rejected retry
 # position. Load this together with the centerlines/surface to see exactly
 # where the script was unhappy without stopping the rest of the run.
-FAILED_CUT_ATTEMPTS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp"
+FAILED_CUT_ATTEMPTS_DEBUG_FILE = File_location  + "\Pulmonary_Artery_Failed_Cut_Attempts_Debug.vtp"
+
+# Rejected inlet contours and their *confirmed* 2-D segment intersection
+# locations. View these files together with the source PA surface in ParaView.
+INLET_REJECTED_CONTOURS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Inlet_Rejected_Contours_Debug.vtp"
+INLET_INTERSECTION_POINTS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Inlet_Intersection_Points_Debug.vtp"
+
+# Validate the inlet on the original triangulated surface BEFORE Stage 1.
+# If none of the nine planes is plausible, fail early and write inlet debug
+# instead of wasting time on all pruning/outlet cuts. Stage 3 rechecks the
+# inlet on the actual post-pruning geometry before applying it.
+ENABLE_EARLY_INLET_PREFLIGHT = True
+INLET_PREFLIGHT_FAIL_FAST = True
+
 
 
 # ============================================================
@@ -88,11 +117,27 @@ CELL_ID_ARRAY = "CellIds"
 # Radius array on the full centerline.
 RADIUS_ARRAY = "Radius"
 
+# NEW inlet plane: halfway along the CENTERLINE ARC LENGTH from the IsInlet
+# point to the FIRST anatomical bifurcation (not halfway by point index).
+ENABLE_INLET_CUT = True
+INLET_CUT_PATH_FRACTION = 0.40
+
+# If the midpoint lies in a poor local mesh region, retry small shifts along
+# the same pre-bifurcation trunk; never move directly onto the bifurcation.
+INLET_RETRY_PATH_FRACTIONS = (0.45, 0.55, 0.40, 0.60, 0.35, 0.65, 0.30, 0.70)
+
+# Use a point safely on the retained/branchward side of the cut for every
+# downstream connectivity operation, not the original IsInlet coordinate.
+INLET_RETAINED_ANCHOR_PATH_FRACTION = 0.80
+
+# Do not write an incorrectly labeled model if the new inlet was not cut.
+REQUIRE_SUCCESSFUL_INLET_CUT = True
+
 # Used as a QC radius for deciding whether the plane intersection loop
 # selected by VTK is plausibly the vessel surrounding this centerline.
 # The exact cut itself is made from the true plane/surface intersection;
 # it is NOT approximated by this circle.
-CUT_RADIUS_FACTOR = 1.35
+CUT_RADIUS_FACTOR = 1.75
 
 # When a side branch disappears from the trimmed centerline, move the
 # plane slightly INTO the removed branch so we are not cutting directly
@@ -101,7 +146,7 @@ CUT_RADIUS_FACTOR = 1.35
 # 0.0 = exactly at the branch junction
 # 0.35 = 35% of the way from the junction to the next point in the
 #        removed centerline branch
-SIDE_BRANCH_OFFSET_FRACTION = 0.35
+SIDE_BRANCH_OFFSET_FRACTION = 0.25
 
 # If a proposed cut is geometrically awkward, retry at nearby locations
 # along the SAME centerline cell before giving up. Offsets are in local
@@ -221,6 +266,14 @@ MAX_LOOP_SELF_INTERSECTIONS = 0
 # location are another indication of a self-touching/overlapping opening.
 # Tolerance is expressed as a fraction of the branch reference radius.
 OVERLAP_VERTEX_TOLERANCE_FACTOR = 1.0e-4
+
+# Use a MUCH tighter tolerance for deciding whether contour EDGES really
+# intersect than for flagging non-adjacent vertices as suspiciously close.
+# A 2-D orientation determinant has units of length^2, so it cannot be
+# compared to a length tolerance directly. The geometry below compares
+# perpendicular distances, with an independent small spatial tolerance.
+LOOP_INTERSECTION_TOLERANCE_RADIUS_FACTOR = 1.0e-8
+LOOP_INTERSECTION_TOLERANCE_ABSOLUTE = 1.0e-10
 
 # Exploratory mode requested for refinement: if all candidate locations for
 # an individual cut fail, skip ONLY that cut and continue processing the
@@ -402,11 +455,11 @@ END_BOX_LOCALITY_FACTOR = 3.0
 TERMINAL_END_ARRAY = "IsTerminalEnd"
 
 # Debug surface for the endpoint boxes actually attempted.
-END_BOXES_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Final_End_Boxes_Debug.vtp"
+END_BOXES_DEBUG_FILE = File_location  + "\Pulmonary_Artery_Final_End_Boxes_Debug.vtp"
 
 # Open surface immediately after the endpoint-box sweep and before the final
 # Mesh Quality cleanup. Useful for isolating what the endpoint boxes changed.
-END_BOX_OPEN_OUTPUT_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_End_Box_Cleaned_Open.vtp"
+END_BOX_OPEN_OUTPUT_FILE = File_location  + "\Pulmonary_Artery_Surface_End_Box_Cleaned_Open.vtp"
 
 # A single cleanup pass is intentionally conservative.  The script reports
 # any Quality > threshold cells that remain afterward so they can be inspected
@@ -415,16 +468,16 @@ MESH_QUALITY_CLEANUP_PASSES = 2
 
 # Final open output after bad-element boxes have been clipped away.  This is
 # intentionally OPEN at any quality-cleanup locations.
-OUTPUT_QUALITY_CLEANED_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Surface_Quality_Cleaned_Open.vtp"
+OUTPUT_QUALITY_CLEANED_FILE = File_location  + "\Pulmonary_Artery_Surface_Quality_Cleaned_Open.vtp"
 
 # Debug: all cells above MESH_QUALITY_THRESHOLD BEFORE cleanup.
-BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Bad_Quality_Cells_Debug.vtp"
+BAD_QUALITY_CELLS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Bad_Quality_Cells_Debug.vtp"
 
 # Debug: oriented boxes actually used for quality cleanup.
-QUALITY_BOXES_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Quality_Clip_Boxes_Debug.vtp"
+QUALITY_BOXES_DEBUG_FILE = File_location + "\Pulmonary_Artery_Quality_Clip_Boxes_Debug.vtp"
 
 # Debug: any cells still above threshold AFTER the cleanup pass(es).
-REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Pulmonary_Artery_Remaining_Bad_Quality_Cells_Debug.vtp"
+REMAINING_BAD_QUALITY_CELLS_DEBUG_FILE = File_location + "\Pulmonary_Artery_Remaining_Bad_Quality_Cells_Debug.vtp"
 
 
 # ============================================================
@@ -1552,6 +1605,288 @@ def build_outlet_cut_definitions(trimmed_centerline):
 
 
 # ============================================================
+# INLET CUT: HALF THE CENTERLINE ARC LENGTH TO FIRST BIFURCATION
+# ============================================================
+
+def trace_inlet_to_first_bifurcation(centerline):
+    """Follow connected centerline cells from IsInlet to the first branch.
+
+    Cell endpoints are grouped by coordinate, because VMTK centerlines can
+    store geometrically identical junction coordinates with distinct point
+    IDs. A bifurcation has at least THREE distinct incident centerline cells.
+    """
+    inlet_array = centerline.GetPointData().GetArray("IsInlet")
+    if inlet_array is None:
+        raise RuntimeError("Trimmed centerline is missing PointData 'IsInlet'.")
+
+    inlet_ids = [
+        i for i in range(centerline.GetNumberOfPoints())
+        if int(round(inlet_array.GetTuple1(i))) == 1
+    ]
+    if len(inlet_ids) != 1:
+        raise RuntimeError(
+            "Expected exactly one IsInlet point, but found {}."
+            .format(len(inlet_ids))
+        )
+
+    inlet_id = int(inlet_ids[0])
+    inlet_xyz = point_tuple(centerline, inlet_id)
+    endpoints = build_endpoint_map(centerline)
+    entries = [
+        e for e in endpoints.get(coordinate_key(inlet_xyz), [])
+        if e["point_id"] == inlet_id
+    ]
+    if len(entries) != 1:
+        raise RuntimeError(
+            "IsInlet must be at one unique centerline cell endpoint; "
+            "found {} matching endpoint cells."
+            .format(len(entries))
+        )
+
+    entry = entries[0]
+    visited = set()
+    segments = []
+    first_branch_xyz = None
+    first_branch_cell_ids = []
+
+    while True:
+        cell_id = entry["cell_id"]
+        if cell_id in visited:
+            raise RuntimeError("Loop in the inlet-to-first-bifurcation centerline graph.")
+        visited.add(cell_id)
+
+        point_ids = ordered_cell_point_ids_from_endpoint(centerline, entry)
+        if len(point_ids) < 2:
+            raise RuntimeError("Inlet trunk contains a degenerate centerline cell.")
+
+        for j in range(len(point_ids) - 1):
+            id0 = point_ids[j]
+            id1 = point_ids[j + 1]
+            p0 = point_tuple(centerline, id0)
+            p1 = point_tuple(centerline, id1)
+            if distance(p0, p1) > PLANE_EPS:
+                segments.append((cell_id, id0, id1))
+
+        distal_xyz = point_tuple(centerline, point_ids[-1])
+        next_entries = endpoints.get(coordinate_key(distal_xyz), [])
+        incident_cells = sorted(set(e["cell_id"] for e in next_entries))
+
+        if len(incident_cells) >= 3:
+            first_branch_xyz = distal_xyz
+            first_branch_cell_ids = incident_cells
+            break
+
+        remaining = [
+            e for e in next_entries
+            if e["cell_id"] != cell_id and e["cell_id"] not in visited
+        ]
+        if len(remaining) != 1:
+            raise RuntimeError(
+                "Could not follow the inlet trunk to its first bifurcation. "
+                "At {} the junction has {} incident cells and {} possible "
+                "continuations."
+                .format(distal_xyz, len(incident_cells), len(remaining))
+            )
+        entry = remaining[0]
+
+    if not segments:
+        raise RuntimeError("No nonzero-length segments on the inlet trunk.")
+
+    total_length = sum(
+        distance(point_tuple(centerline, p0), point_tuple(centerline, p1))
+        for _, p0, p1 in segments
+    )
+    if total_length <= PLANE_EPS:
+        raise RuntimeError("Zero inlet-to-first-bifurcation path length.")
+
+    return {
+        "inlet_point_id": inlet_id,
+        "inlet_xyz": inlet_xyz,
+        "branch_xyz": first_branch_xyz,
+        "branch_cell_ids": first_branch_cell_ids,
+        "segments": segments,
+        "total_length": total_length,
+        "visited_cell_ids": sorted(visited),
+    }
+
+
+def sample_inlet_trunk(centerline, trace, fraction):
+    """Interpolate position/radius/tangent using true cumulative arc length."""
+    radius_array = centerline.GetPointData().GetArray(RADIUS_ARRAY)
+    if radius_array is None:
+        raise RuntimeError("Trimmed centerline is missing PointData '{}'".format(RADIUS_ARRAY))
+
+    fraction = float(fraction)
+    if not (0.0 < fraction < 1.0):
+        raise ValueError("Inlet trunk sampling fraction must be between 0 and 1.")
+
+    target = trace["total_length"] * fraction
+    travelled = 0.0
+    segments = trace["segments"]
+
+    for segment_index, (cell_id, id0, id1) in enumerate(segments):
+        p0 = point_tuple(centerline, id0)
+        p1 = point_tuple(centerline, id1)
+        length = distance(p0, p1)
+        if length <= PLANE_EPS:
+            continue
+
+        if travelled + length >= target or segment_index == len(segments) - 1:
+            t = min(1.0, max(0.0, (target - travelled) / length))
+            forward = normalize(vec_sub(p1, p0))
+            r0 = float(radius_array.GetTuple1(id0))
+            r1 = float(radius_array.GetTuple1(id1))
+            valid0 = math.isfinite(r0) and r0 > 0.0
+            valid1 = math.isfinite(r1) and r1 > 0.0
+            if valid0 and valid1:
+                radius = (1.0-t)*r0 + t*r1
+            elif valid0:
+                radius = r0
+            elif valid1:
+                radius = r1
+            else:
+                raise RuntimeError(
+                    "Inlet trunk has no valid Radius at path fraction {}."
+                    .format(fraction)
+                )
+            return {
+                "center": vec_add(p0, vec_scale(vec_sub(p1, p0), t)),
+                "forward": forward,
+                "radius": radius,
+                "source_cell_id": int(cell_id),
+                "path_fraction": fraction,
+            }
+        travelled += length
+
+    raise RuntimeError("Could not interpolate the inlet centerline trunk.")
+
+
+def build_inlet_cut_definition(trimmed_centerline):
+    """Make a normal pointing from the first bifurcation TOWARD old inlet.
+
+    The exact cut implementation retains the NEGATIVE side of its plane;
+    therefore this reversed normal keeps the bifurcation/pulmonary tree and
+    discards the unwanted original inlet stub.
+    """
+    trace = trace_inlet_to_first_bifurcation(trimmed_centerline)
+    base = sample_inlet_trunk(
+        trimmed_centerline, trace, INLET_CUT_PATH_FRACTION
+    )
+    retained = sample_inlet_trunk(
+        trimmed_centerline, trace, INLET_RETAINED_ANCHOR_PATH_FRACTION
+    )
+    cut = {
+        "type": "inlet",
+        "center": base["center"],
+        "junction": trace["inlet_xyz"],
+        "normal": vec_scale(base["forward"], -1.0),
+        "radius": base["radius"],
+        "reference_radius": base["radius"],
+        "cut_radius": base["radius"] * CUT_RADIUS_FACTOR,
+        "source_cell_id": base["source_cell_id"],
+        "source_endpoint_local_id": 0,
+        "source_point_id": trace["inlet_point_id"],
+        "removed_cell_ids": [],
+        "retained_anchor": retained["center"],
+        "first_bifurcation": trace["branch_xyz"],
+        "inlet_path_length": trace["total_length"],
+        "retry_path_fraction": float(INLET_CUT_PATH_FRACTION),
+    }
+
+    retries = []
+    for fraction in INLET_RETRY_PATH_FRACTIONS:
+        if abs(float(fraction) - INLET_CUT_PATH_FRACTION) < 1.0e-12:
+            continue
+        sample = sample_inlet_trunk(trimmed_centerline, trace, fraction)
+        alternate = dict(cut)
+        alternate.update({
+            "center": sample["center"],
+            "normal": vec_scale(sample["forward"], -1.0),
+            "radius": sample["radius"],
+            "reference_radius": sample["radius"],
+            "cut_radius": sample["radius"] * CUT_RADIUS_FACTOR,
+            "source_cell_id": sample["source_cell_id"],
+            "retry_path_fraction": float(fraction),
+            "retry_distance_from_anchor": fraction * trace["total_length"],
+        })
+        retries.append(alternate)
+    cut["retry_candidates"] = retries
+
+    return cut, trace
+
+
+# ============================================================
+# SIDEDNESS / AUTOMATIC CAP NAMES
+# ============================================================
+
+def get_centerline_sidedness_array(centerline):
+    sidedness = centerline.GetPointData().GetAbstractArray(SIDEDNESS_ARRAY)
+    if sidedness is None:
+        if REQUIRE_SIDEDNESS_ARRAY:
+            raise RuntimeError(
+                "Trimmed centerline missing PointData '{}' array."
+                .format(SIDEDNESS_ARRAY)
+            )
+        print(
+            "WARNING: trimmed centerline has no '{}' PointData. "
+            "Non-inlet caps will be named Other#."
+            .format(SIDEDNESS_ARRAY)
+        )
+    return sidedness
+
+
+def sidedness_at_point(sidedness_array, point_id):
+    if sidedness_array is None:
+        return "Other"
+
+    # vtkStringArray, vtkVariantArray and string-compatible VTK arrays.
+    try:
+        value = sidedness_array.GetVariantValue(int(point_id)).ToString()
+    except (AttributeError, TypeError, ValueError):
+        try:
+            value = str(sidedness_array.GetValue(int(point_id)))
+        except (AttributeError, TypeError, ValueError):
+            return "Other"
+
+    text = str(value).strip().casefold()
+    if text == "left":
+        return "Left"
+    if text == "right":
+        return "Right"
+    return "Other"
+
+
+def build_sidedness_point_locator(trimmed_centerline):
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(trimmed_centerline)
+    locator.BuildLocator()
+    return locator
+
+
+def classify_loop_sidedness(
+    centroid, trimmed_centerline, sidedness_array, locator,
+    accepted_cut=None
+):
+    """Prefer the correct source IsOutlet point when the loop matches a cut.
+
+    For branch-pruning cuts, synthetic terminal cuts, and unmatched boundary
+    loops, use the closest trimmed-centerline point in 3D instead.
+    """
+    if sidedness_array is None:
+        return "Other"
+
+    if accepted_cut is not None and accepted_cut.get("type") == "outlet":
+        point_id = accepted_cut.get("source_point_id", -1)
+        if 0 <= point_id < trimmed_centerline.GetNumberOfPoints():
+            return sidedness_at_point(sidedness_array, point_id)
+
+    closest_point_id = int(locator.FindClosestPoint(centroid))
+    if closest_point_id < 0:
+        return "Other"
+    return sidedness_at_point(sidedness_array, closest_point_id)
+
+
+# ============================================================
 # DEBUG CIRCLES FOR THE INTENDED CUT PLANES
 # ============================================================
 
@@ -1650,6 +1985,8 @@ def write_cut_debug_file(cuts, filename):
             cut_type.InsertNextValue(1)
         elif cut["type"] == "terminal":
             cut_type.InsertNextValue(2)
+        elif cut["type"] == "inlet":
+            cut_type.InsertNextValue(5)
         else:
             # 3 = true IsOutlet cut from the trimmed centerline
             cut_type.InsertNextValue(3)
@@ -1729,92 +2066,148 @@ def point_distance_2d(a, b):
     return math.sqrt(dx * dx + dy * dy)
 
 
-def on_segment_2d(a, b, p, tol):
+def cross_2d(a, b):
+    return a[0] * b[1] - a[1] * b[0]
 
-    if abs(orientation_2d(a, b, p)) > tol:
-        return False
 
-    return (
-        min(a[0], b[0]) - tol <= p[0] <= max(a[0], b[0]) + tol
-        and min(a[1], b[1]) - tol <= p[1] <= max(a[1], b[1]) + tol
-    )
+def point_to_segment_distance_2d(p, a, b):
+    """Return distance, projection parameter, and closest point in XY."""
+    vx, vy = b[0] - a[0], b[1] - a[1]
+    denom = vx * vx + vy * vy
+    if denom <= 1.0e-30:
+        return point_distance_2d(p, a), 0.0, a
+    t = ((p[0] - a[0])*vx + (p[1] - a[1])*vy) / denom
+    tc = min(1.0, max(0.0, t))
+    nearest = (a[0] + tc*vx, a[1] + tc*vy)
+    return point_distance_2d(p, nearest), t, nearest
+
+
+def segment_intersection_detail_2d(a, b, c, d, tol):
+    """Detect actual crossing, on-segment touch, or collinear overlap.
+
+    `tol` is a LENGTH. Unlike the previous test, a 2-D orientation
+    determinant (L^2) is never directly compared to a length tolerance.
+    Near-but-disjoint edges are not counted as physical intersections.
+    """
+    ab = (b[0] - a[0], b[1] - a[1])
+    cd = (d[0] - c[0], d[1] - c[1])
+    lab = math.hypot(*ab)
+    lcd = math.hypot(*cd)
+    if lab <= tol or lcd <= tol:
+        return None
+
+    if (max(a[0], b[0]) + tol < min(c[0], d[0])
+        or max(c[0], d[0]) + tol < min(a[0], b[0])
+        or max(a[1], b[1]) + tol < min(c[1], d[1])
+        or max(c[1], d[1]) + tol < min(a[1], b[1])):
+        return None
+
+    # Signed perpendicular distances (L) of endpoints to each line.
+    d_c = orientation_2d(a, b, c) / lab
+    d_d = orientation_2d(a, b, d) / lab
+    d_a = orientation_2d(c, d, a) / lcd
+    d_b = orientation_2d(c, d, b) / lcd
+
+    opposite_ab = (d_c > tol and d_d < -tol) or (d_c < -tol and d_d > tol)
+    opposite_cd = (d_a > tol and d_b < -tol) or (d_a < -tol and d_b > tol)
+    cp = (c[0] - a[0], c[1] - a[1])
+    den = cross_2d(ab, cd)
+
+    if opposite_ab and opposite_cd and den != 0.0:
+        t = cross_2d(cp, cd) / den
+        u = cross_2d(cp, ab) / den
+        if 0.0 < t < 1.0 and 0.0 < u < 1.0:
+            return {
+                "kind": "crossing",
+                "xy": (a[0] + t*ab[0], a[1] + t*ab[1])
+            }
+
+    # Exact or tolerance-level collinearity: check overlap of 1-D
+    # projected intervals. Just being nearly parallel is not an overlap.
+    if all(abs(s) <= tol for s in (d_c, d_d, d_a, d_b)):
+        t0 = (cp[0]*ab[0] + cp[1]*ab[1]) / (lab*lab)
+        t1 = t0 + (cd[0]*ab[0] + cd[1]*ab[1]) / (lab*lab)
+        lo = max(0.0, min(t0, t1))
+        hi = min(1.0, max(t0, t1))
+        if (hi - lo)*lab > tol:
+            tm = 0.5*(lo + hi)
+            return {
+                "kind": "overlap",
+                "xy": (a[0]+tm*ab[0], a[1]+tm*ab[1])
+            }
+
+    # Non-adjacent endpoint lying on another segment. Explicitly require
+    # proximity to the segment itself, not just an orientation sign.
+    for p, p0, p1 in ((a, c, d), (b, c, d), (c, a, b), (d, a, b)):
+        distance_to_seg, t, near = point_to_segment_distance_2d(p, p0, p1)
+        if distance_to_seg <= tol and -tol/max(lab, lcd) <= t <= 1.0+tol/max(lab, lcd):
+            return {"kind": "touch", "xy": near}
+
+    return None
 
 
 def segments_intersect_2d(a, b, c, d, tol):
+    """Backward-compatible boolean used by earlier QC helpers."""
+    return segment_intersection_detail_2d(a, b, c, d, tol) is not None
 
-    o1 = orientation_2d(a, b, c)
-    o2 = orientation_2d(a, b, d)
-    o3 = orientation_2d(c, d, a)
-    o4 = orientation_2d(c, d, b)
 
-    # Proper crossing.
-    if (
-        ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol))
-        and ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol))
-    ):
-        return True
-
-    # Collinear/self-touching cases.
-    if abs(o1) <= tol and on_segment_2d(a, b, c, tol):
-        return True
-    if abs(o2) <= tol and on_segment_2d(a, b, d, tol):
-        return True
-    if abs(o3) <= tol and on_segment_2d(c, d, a, tol):
-        return True
-    if abs(o4) <= tol and on_segment_2d(c, d, b, tol):
-        return True
-
-    return False
+def inspect_nonadjacent_loop_intersections(xy, tol):
+    """Return detailed confirmed intersections for debug output."""
+    n = len(xy)
+    details = []
+    for i in range(n):
+        jmin = i + 2
+        for j in range(jmin, n):
+            # Edges i and j must not share a topological loop vertex.
+            if i == 0 and j == n - 1:
+                continue
+            detail = segment_intersection_detail_2d(
+                xy[i], xy[(i + 1) % n],
+                xy[j], xy[(j + 1) % n], tol
+            )
+            if detail is not None:
+                details.append({"edge_i": i, "edge_j": j, **detail})
+    return details
 
 
 def count_nonadjacent_loop_intersections(xy, tol):
+    return len(inspect_nonadjacent_loop_intersections(xy, tol))
 
+
+def find_nonadjacent_near_duplicate_vertices(xy, tol):
+    """Flag nearly coincident points only when far apart along the loop.
+
+    In a finely sampled but valid contour, vertices only 2 or 3 edges apart
+    can lie very close together. Such neighbors are NOT a folded/self-touching
+    loop. Compare Euclidean distance against shortest along-loop arclength.
+    """
     n = len(xy)
-    count = 0
-
+    if n < 4:
+        return []
+    cumulative = [0.0]
     for i in range(n):
-        i2 = (i + 1) % n
-        a = xy[i]
-        b = xy[i2]
-
-        for j in range(i + 1, n):
-            j2 = (j + 1) % n
-
-            # Adjacent polygon edges are expected to share one endpoint.
-            if j == i or j == i2 or j2 == i:
+        cumulative.append(cumulative[-1] +
+                          point_distance_2d(xy[i], xy[(i+1) % n]))
+    perimeter = cumulative[-1]
+    hits = []
+    for i in range(n):
+        for j in range(i+2, n):
+            if i == 0 and j == n-1:
                 continue
-
-            # First and final edges are adjacent through vertex 0.
-            if i == 0 and j2 == 0:
+            dist = point_distance_2d(xy[i], xy[j])
+            if dist > tol:
                 continue
-
-            c = xy[j]
-            d = xy[j2]
-
-            if segments_intersect_2d(a, b, c, d, tol):
-                count += 1
-
-    return count
+            along = cumulative[j] - cumulative[i]
+            shortest = min(along, perimeter - along)
+            if shortest <= 5.0*tol:
+                continue
+            hits.append((i, j, ((xy[i][0]+xy[j][0])*0.5,
+                                (xy[i][1]+xy[j][1])*0.5)))
+    return hits
 
 
 def count_nonadjacent_near_duplicate_vertices(xy, tol):
-
-    n = len(xy)
-    count = 0
-
-    for i in range(n):
-        for j in range(i + 1, n):
-
-            if j == i + 1:
-                continue
-
-            if i == 0 and j == n - 1:
-                continue
-
-            if point_distance_2d(xy[i], xy[j]) <= tol:
-                count += 1
-
-    return count
+    return len(find_nonadjacent_near_duplicate_vertices(xy, tol))
 
 
 def compute_loop_shape_metrics(loop, cut):
@@ -2016,15 +2409,35 @@ def compute_loop_shape_metrics(loop, cut):
         1e-9
     )
 
-    self_intersections = count_nonadjacent_loop_intersections(
-        xy,
-        overlap_tol
+    # A strict spatial tolerance is necessary for *actual* intersections.
+    # The more generous overlap_tol remains dedicated to identifying nearly
+    # coincident but not literally intersecting non-adjacent vertices.
+    intersection_tol = max(
+        overlap_scale * LOOP_INTERSECTION_TOLERANCE_RADIUS_FACTOR,
+        LOOP_INTERSECTION_TOLERANCE_ABSOLUTE,
+        MERGE_TOLERANCE * 0.1,
     )
+    intersection_details = inspect_nonadjacent_loop_intersections(
+        xy, intersection_tol
+    )
+    self_intersections = len(intersection_details)
+    intersection_points_3d = []
+    for hit in intersection_details:
+        x, y = hit["xy"]
+        p = vec_add(cut["center"],
+                    vec_add(vec_scale(u, x), vec_scale(v, y)))
+        intersection_points_3d.append((p, hit["kind"]))
 
-    near_duplicate_vertices = count_nonadjacent_near_duplicate_vertices(
-        xy,
-        overlap_tol
+    near_duplicate_details = find_nonadjacent_near_duplicate_vertices(
+        xy, overlap_tol
     )
+    near_duplicate_vertices = len(near_duplicate_details)
+    near_duplicate_points_3d = []
+    for _i, _j, (x, y) in near_duplicate_details:
+        near_duplicate_points_3d.append(
+            vec_add(cut["center"],
+                    vec_add(vec_scale(u, x), vec_scale(v, y)))
+        )
 
     return {
         "loop_area": area,
@@ -2042,7 +2455,10 @@ def compute_loop_shape_metrics(loop, cut):
         "raw_segment_length": raw_segment_length,
         "segment_redundancy_ratio": segment_redundancy_ratio,
         "self_intersections": self_intersections,
-        "near_duplicate_vertices": near_duplicate_vertices
+        "intersection_points_3d": intersection_points_3d,
+        "near_duplicate_vertices": near_duplicate_vertices,
+        "near_duplicate_points_3d": near_duplicate_points_3d,
+        "intersection_spatial_tolerance": intersection_tol,
     }
 
 
@@ -2164,6 +2580,8 @@ def find_target_cut_loop(surface, cut):
             )
 
     retry_suspicious = (
+        cut.get("type") == "inlet"
+        or
         (
             cut.get("type") == "side_branch"
             and RETRY_SUSPICIOUS_SIDE_BRANCH_LOOPS
@@ -2194,7 +2612,10 @@ def find_target_cut_loop(surface, cut):
         )
 
         if retry_suspicious:
-            raise SuspiciousCutLoop(message)
+            exc = SuspiciousCutLoop(message)
+            exc.debug_loop = loop
+            exc.debug_shape_stats = {}
+            raise exc
 
         if FAIL_ON_SUSPICIOUS_LOOP:
             raise RuntimeError(message)
@@ -2315,10 +2736,14 @@ def find_target_cut_loop(surface, cut):
             )
 
         if shape_failures:
-            raise SuspiciousCutLoop(
+            exc = SuspiciousCutLoop(
                 "Suspicious cross-section shape: "
                 + "; ".join(shape_failures)
             )
+            # Keep actual rejected cutter polyline for inlet diagnostics.
+            exc.debug_loop = loop
+            exc.debug_shape_stats = shape_stats
+            raise exc
 
     stats = {
         "num_loop_points": loop.GetNumberOfPoints(),
@@ -2838,6 +3263,150 @@ def apply_exact_local_plane_cut(surface, cut, cleanup_result=True):
     return result, loop, cap, stats
 
 
+# ============================================================
+# INLET DEBUG OUTPUT + EARLY GEOMETRY PREFLIGHT
+# ============================================================
+
+def write_inlet_rejection_debug(records):
+    """Write rejected contours and actual intersection locations.
+
+    Each line segment has AttemptNumber, PathFraction, ValidationStage,
+    and rejection count arrays for ParaView inspection. Input is never
+    modified. Returns paths of files that were written.
+    """
+    if not records:
+        return []
+
+    points = vtk.vtkPoints()
+    cells = vtk.vtkCellArray()
+    count_arr = vtk.vtkIntArray()
+    count_arr.SetName("SelfIntersections")
+    duplicate_arr = vtk.vtkIntArray()
+    duplicate_arr.SetName("NearDuplicateVertices")
+    attempt_arr = vtk.vtkIntArray()
+    attempt_arr.SetName("AttemptNumber")
+    fraction_arr = vtk.vtkDoubleArray()
+    fraction_arr.SetName("PathFraction")
+    stage_arr = vtk.vtkIntArray()
+    stage_arr.SetName("ValidationStage") # 0 preflight, 1 stage3
+
+    ipoints = vtk.vtkPoints()
+    iverts = vtk.vtkCellArray()
+    itype = vtk.vtkIntArray()
+    itype.SetName("IntersectionType") # 1 crossing, 2 touch, 3 overlap, 4 near duplicate
+    iattempt = vtk.vtkIntArray()
+    iattempt.SetName("AttemptNumber")
+    ifraction = vtk.vtkDoubleArray()
+    ifraction.SetName("PathFraction")
+    istage = vtk.vtkIntArray()
+    istage.SetName("ValidationStage")
+    type_code = {"crossing": 1, "touch": 2, "overlap": 3}
+
+    for candidate, error, stage in records:
+        loop = getattr(error, "debug_loop", None)
+        stats = getattr(error, "debug_shape_stats", {}) or {}
+        attempt = int(candidate.get("attempt_number", 0))
+        fraction = float(candidate.get("retry_path_fraction", INLET_CUT_PATH_FRACTION))
+        stage_code = 0 if stage == "preflight" else 1
+        if loop is not None:
+            for cell_id in range(loop.GetNumberOfCells()):
+                cell = loop.GetCell(cell_id)
+                if cell is None or cell.GetNumberOfPoints() < 2:
+                    continue
+                line = vtk.vtkPolyLine()
+                line.GetPointIds().SetNumberOfIds(cell.GetNumberOfPoints())
+                for k in range(cell.GetNumberOfPoints()):
+                    p = loop.GetPoint(cell.GetPointId(k))
+                    pid = points.InsertNextPoint(p)
+                    line.GetPointIds().SetId(k, pid)
+                cells.InsertNextCell(line)
+                count_arr.InsertNextValue(int(stats.get("self_intersections", 0)))
+                duplicate_arr.InsertNextValue(int(stats.get("near_duplicate_vertices", 0)))
+                attempt_arr.InsertNextValue(attempt)
+                fraction_arr.InsertNextValue(fraction)
+                stage_arr.InsertNextValue(stage_code)
+        marker_positions = list(stats.get("intersection_points_3d", []))
+        marker_positions.extend(
+            (position, "near_duplicate")
+            for position in stats.get("near_duplicate_points_3d", [])
+        )
+        for position, kind in marker_positions:
+            pid = ipoints.InsertNextPoint(position)
+            vert = vtk.vtkVertex()
+            vert.GetPointIds().SetId(0, pid)
+            iverts.InsertNextCell(vert)
+            itype.InsertNextValue(
+                4 if kind == "near_duplicate" else type_code.get(kind, 0)
+            )
+            iattempt.InsertNextValue(attempt)
+            ifraction.InsertNextValue(fraction)
+            istage.InsertNextValue(stage_code)
+
+    written = []
+    if cells.GetNumberOfCells() > 0:
+        out = vtk.vtkPolyData()
+        out.SetPoints(points)
+        out.SetLines(cells)
+        for arr in (count_arr, duplicate_arr, attempt_arr, fraction_arr, stage_arr):
+            out.GetCellData().AddArray(arr)
+        write_polydata(out, INLET_REJECTED_CONTOURS_DEBUG_FILE)
+        written.append(INLET_REJECTED_CONTOURS_DEBUG_FILE)
+    if iverts.GetNumberOfCells() > 0:
+        out = vtk.vtkPolyData()
+        out.SetPoints(ipoints)
+        out.SetVerts(iverts)
+        for arr in (itype, iattempt, ifraction, istage):
+            out.GetCellData().AddArray(arr)
+        write_polydata(out, INLET_INTERSECTION_POINTS_DEBUG_FILE)
+        written.append(INLET_INTERSECTION_POINTS_DEBUG_FILE)
+    for path in written:
+        print("  Inlet diagnostic:", path)
+    return written
+
+
+def preflight_inlet_cut(surface, cut, collector):
+    """Find first plausible inlet cross-section before the costly cut loop.
+
+    Check the *original* triangulated surface and verify the selected cutter
+    loop maps to some actual source surface triangles. The final Stage-3 cut
+    still performs full QC against the modified post-outlet surface.
+    """
+    attempts = [dict(cut)] + [dict(c) for c in cut.get("retry_candidates", [])]
+    print("\n============================================")
+    print("EARLY INLET PREFLIGHT (before pruning)")
+    print("============================================")
+    for i, candidate in enumerate(attempts):
+        candidate["attempt_number"] = i + 1
+        try:
+            loop, plane, stats = find_target_cut_loop(surface, candidate)
+            crossing = find_source_cells_for_loop(surface, loop, plane, candidate)
+            if len(crossing) == 0:
+                raise RuntimeError("No intersected source triangles for inlet contour")
+            fraction = candidate.get("retry_path_fraction", INLET_CUT_PATH_FRACTION)
+            print("  Accepted preflight plane: {:.0f}% inlet trunk, {} crossing triangles".format(
+                100*float(fraction), len(crossing)))
+            return candidate
+        except Exception as exc:
+            collector.append((dict(candidate), exc, "preflight"))
+            print("  Rejected inlet fraction {:.0f}%: {}".format(
+                100 * float(candidate.get("retry_path_fraction", INLET_CUT_PATH_FRACTION)),
+                exc))
+    print("  WARNING: no inlet retry passed early validation.")
+    return None
+
+
+def prioritize_prevalidated_inlet_cut(cut, selected):
+    """Try the prevalidated plane first; retain all remaining retries."""
+    if selected is None:
+        return
+    variants = [dict(cut)] + [dict(c) for c in cut.get("retry_candidates", [])]
+    selected_fraction = float(selected.get("retry_path_fraction", INLET_CUT_PATH_FRACTION))
+    primary = next(c for c in variants if abs(float(c.get("retry_path_fraction", INLET_CUT_PATH_FRACTION)) - selected_fraction) < 1.e-12)
+    rest = [c for c in variants if c is not primary]
+    cut.update({key: value for key, value in primary.items() if key != "retry_candidates"})
+    cut["retry_candidates"] = rest
+
+
 class CutRetriesExhausted(RuntimeError):
 
     def __init__(self, cut, attempts, failure_messages):
@@ -2855,7 +3424,8 @@ class CutRetriesExhausted(RuntimeError):
         )
 
 
-def apply_cut_with_retries(surface, cut, cleanup_result=True):
+def apply_cut_with_retries(surface, cut, cleanup_result=True,
+                           inlet_debug_collector=None):
 
     # Always try the originally planned plane first. Only if that attempt
     # fails do we walk to nearby positions on the same centerline cell.
@@ -2921,6 +3491,9 @@ def apply_cut_with_retries(surface, cut, cleanup_result=True):
             return result, loop, cap, stats, candidate
 
         except Exception as exc:
+            if (candidate.get("type") == "inlet"
+                    and inlet_debug_collector is not None):
+                inlet_debug_collector.append((dict(candidate), exc, "stage3"))
 
             # In this refinement/debugging version, geometric failures are
             # deliberately treated as retryable. This includes: no local
@@ -2979,6 +3552,8 @@ def annotate_loop(loop, cut_index, cut):
         type_value = 1
     elif cut["type"] == "terminal":
         type_value = 2
+    elif cut["type"] == "inlet":
+        type_value = 5
     else:
         type_value = 3
 
@@ -3421,92 +3996,121 @@ def boundary_edge_count(surface):
     return edges.GetOutput().GetNumberOfCells()
 
 
-def build_final_capped_face_model(open_surface, inlet_xyz, accepted_cuts):
-    """
-    Cap every ACTUAL final boundary loop, stamp ModelFaceID, and return
-    (capped_surface, assignments, loop_debug).
+def build_final_capped_face_model(
+    open_surface,
+    accepted_inlet_cut,
+    accepted_cuts,
+    trimmed_centerline
+):
+    """Cap actual final openings, name INLET and Left#/Right#/Other#.
 
-    Face 1 is always Wall.  Boundary loops are assigned IDs 2..N.  The loop
-    nearest the inlet is assigned first; the rest are ordered by proximity to
-    the accepted centerline-driven cut locations.  This gives stable face IDs
-    tied to the geometry we actually cut rather than to arbitrary VTK cell
-    order.
+    ModelFaceID=1 always Wall; =2 always INLET. All remaining faces are
+    incrementally named within their individual centerline Sidedness classes.
     """
-
     loops = extract_final_boundary_loops(open_surface)
     if not loops:
+        raise RuntimeError("Final open surface has no boundary loops to cap.")
+
+    if accepted_inlet_cut is None:
         raise RuntimeError(
-            "Final open surface has no boundary loops to cap."
+            "Cannot label final INLET: no accepted inlet cut exists."
         )
 
-    # Reference centers from successful cuts.  These are used only to make the
-    # cap ordering deterministic and anatomically tied to the cut locations.
-    cut_refs = []
-    for key, cut in accepted_cuts.items():
-        if cut is None or cut.get("center") is None:
-            continue
-        cut_refs.append((int(key), cut))
-
-    # Inlet first.
+    inlet_cut_center = accepted_inlet_cut["center"]
+    inlet_cut_radius = float(accepted_inlet_cut["radius"])
     inlet_loop_index = min(
         range(len(loops)),
-        key=lambda i: distance(loops[i]["centroid"], inlet_xyz)
+        key=lambda i: distance(loops[i]["centroid"], inlet_cut_center)
     )
+    inlet_distance = distance(
+        loops[inlet_loop_index]["centroid"], inlet_cut_center
+    )
+    if inlet_distance > INLET_CAP_MAX_DISTANCE_RADII * inlet_cut_radius:
+        raise RuntimeError(
+            "No final boundary loop is close enough to the inlet cutting "
+            "plane to label INLET. Nearest distance={:.6g}, local radius={:.6g}. "
+            "Inspect the inlet and endpoint-box outputs."
+            .format(inlet_distance, inlet_cut_radius)
+        )
 
+    # Stable ordering by corresponding accepted cuts, then loop center.
+    cut_refs = sorted(
+        (int(key), cut)
+        for key, cut in accepted_cuts.items()
+        if cut is not None and cut.get("center") is not None
+        and cut.get("type") != "inlet"
+    )
     remaining = [i for i in range(len(loops)) if i != inlet_loop_index]
-
-    def loop_sort_key(i):
-        if not cut_refs:
-            c = loops[i]["centroid"]
-            return (float("inf"), c[0], c[1], c[2])
-
+    closest_cuts = {}
+    for i in remaining:
         best = None
         for planned_index, cut in cut_refs:
             d = distance(loops[i]["centroid"], cut["center"])
             candidate = (d, planned_index)
-            if best is None or candidate < best:
-                best = candidate
-        return (best[1], best[0])
+            if best is None or candidate < best[0]:
+                best = (candidate, cut)
+        closest_cuts[i] = best
+
+    def loop_sort_key(i):
+        center = loops[i]["centroid"]
+        matched = closest_cuts[i]
+        if matched is None:
+            return (float("inf"), float("inf"), *center)
+        (distance_to_cut, planned_index), _cut = matched
+        return (planned_index, distance_to_cut, *center)
 
     remaining.sort(key=loop_sort_key)
     ordered_indices = [inlet_loop_index] + remaining
 
     wall = set_uniform_model_face_id(
-        triangulate_polydata(open_surface),
-        FINAL_CAP_WALL_FACE_ID
+        triangulate_polydata(open_surface), FINAL_CAP_WALL_FACE_ID
     )
-
-    assignments = {
-        int(FINAL_CAP_WALL_FACE_ID): "Wall"
-    }
+    assignments = {int(FINAL_CAP_WALL_FACE_ID): "Wall"}
+    counters = {"Left": 0, "Right": 0, "Other": 0}
+    sidedness_array = get_centerline_sidedness_array(trimmed_centerline)
+    locator = build_sidedness_point_locator(trimmed_centerline)
 
     cap_surfaces = []
     debug_loops = []
-
     for ordinal, loop_index in enumerate(ordered_indices, start=2):
         info = loops[loop_index]
         face_id = int(ordinal)
 
+        if loop_index == inlet_loop_index:
+            face_name = FINAL_CAP_INLET_NAME
+        else:
+            matched = closest_cuts.get(loop_index)
+            accepted_cut = None
+            if matched is not None:
+                (dist_to_cut, _planned_index), candidate_cut = matched
+                # Don't attribute a distant remnant loop to an unrelated
+                # outlet's source-cell Sidedness solely because it is the
+                # nearest of the accepted cuts.
+                radius = float(candidate_cut.get("radius", 0.0))
+                if radius > 0.0 and dist_to_cut <= 3.0 * radius:
+                    accepted_cut = candidate_cut
+
+            group = classify_loop_sidedness(
+                info["centroid"], trimmed_centerline,
+                sidedness_array, locator, accepted_cut=accepted_cut
+            )
+            counters[group] += 1
+            prefix = {
+                "Left": LEFT_CAP_PREFIX,
+                "Right": RIGHT_CAP_PREFIX,
+                "Other": OTHER_CAP_PREFIX,
+            }[group]
+            face_name = "{}{}".format(prefix, counters[group])
+
         cap = build_radial_ring_cap(
-            info["points"],
-            FINAL_CAP_INTERIOR_RINGS
+            info["points"], FINAL_CAP_INTERIOR_RINGS
         )
-
-        cap = make_cap_compatible_with_surface(
-            cap,
-            wall,
-            face_id
-        )
-
+        cap = make_cap_compatible_with_surface(cap, wall, face_id)
         cap_surfaces.append(cap)
-
-        assignments[face_id] = (
-            FINAL_CAP_FACE_NAME_PREFIX + str(face_id)
-        )
+        assignments[face_id] = face_name
 
         debug_loop = vtk.vtkPolyData()
         debug_loop.DeepCopy(info["polydata"])
-
         fid_arr = vtk.vtkIntArray()
         fid_arr.SetName("ModelFaceID")
         fid_arr.SetNumberOfTuples(debug_loop.GetNumberOfCells())
@@ -3517,18 +4121,15 @@ def build_final_capped_face_model(open_surface, inlet_xyz, accepted_cuts):
         worst_ratio = cap_edge_ratio_stats(cap)
         if worst_ratio > FINAL_CAP_EDGE_RATIO_WARN:
             print(
-                "  WARNING: final cap fid={} has max edge ratio {:.2f}"
-                .format(face_id, worst_ratio)
+                "  WARNING: final cap {} (fid={}) has max edge ratio {:.2f}"
+                .format(face_name, face_id, worst_ratio)
             )
 
     capped = append_polydata_list(
-        [wall] + cap_surfaces,
-        clean_result=True
+        [wall] + cap_surfaces, clean_result=True
     )
     capped = triangulate_polydata(capped)
 
-    # If any cap failed to weld to the exact outer loop, do not silently write
-    # a supposedly watertight model.
     remaining_boundary_edges = boundary_edge_count(capped)
     if remaining_boundary_edges != 0:
         raise RuntimeError(
@@ -3547,15 +4148,18 @@ def build_final_capped_face_model(open_surface, inlet_xyz, accepted_cuts):
 
     capped_with_normals = vtk.vtkPolyData()
     capped_with_normals.DeepCopy(normals.GetOutput())
-
     if REGENERATE_GLOBAL_IDS:
         regenerate_global_ids(capped_with_normals)
 
-    loop_debug = append_polydata_list(
-        debug_loops,
-        clean_result=False
-    ) if debug_loops else vtk.vtkPolyData()
-
+    loop_debug = (
+        append_polydata_list(debug_loops, clean_result=False)
+        if debug_loops else vtk.vtkPolyData()
+    )
+    print(
+        "Cap naming summary: INLET=1, Left={}, Right={}, Other={}".format(
+            counters["Left"], counters["Right"], counters["Other"]
+        )
+    )
     return capped_with_normals, assignments, loop_debug
 
 
@@ -4391,6 +4995,7 @@ def make_end_box_debug_polydata(plan, box_index):
         "terminal": 2,
         "outlet": 3,
         "terminal_marker": 4,
+        "inlet": 5,
     }
 
     arrays = [
@@ -4838,7 +5443,18 @@ outlet_cuts, outlet_topology_skips = build_outlet_cut_definitions(
     trimmed_centerline
 )
 
+# Append the separate inlet cut LAST so all historical IsOutlet indices stay
+# unchanged; the stage-3 inlet operation uses the next planned cut index.
+if ENABLE_INLET_CUT:
+    inlet_cut_definition, inlet_path = build_inlet_cut_definition(
+        trimmed_centerline
+    )
+else:
+    inlet_cut_definition, inlet_path = None, None
+
 all_planned_cuts = pruning_cuts + outlet_cuts
+if inlet_cut_definition is not None:
+    all_planned_cuts.append(inlet_cut_definition)
 
 print("")
 print("============================================")
@@ -4849,6 +5465,12 @@ print("Side-branch pruning cuts:", side_cut_count)
 print("Synthetic pruning-terminal cuts:", terminal_cut_count)
 print("Trimmed-centerline IsOutlet cuts planned:", len(outlet_cuts))
 print("IsOutlet points skipped for centerline topology/radius:", outlet_topology_skips)
+if inlet_cut_definition is not None:
+    print("Inlet cut planned at: {:.0f}% inlet-to-first-bifurcation arclength".format(
+        100 * INLET_CUT_PATH_FRACTION
+    ))
+    print("Inlet trunk length:", inlet_path["total_length"])
+    print("First bifurcation location:", inlet_path["branch_xyz"])
 print("Total planned surface cuts:", len(all_planned_cuts))
 
 if len(all_planned_cuts) == 0:
@@ -4869,8 +5491,8 @@ if VERBOSE_CUT_LOG:
         print("    Expected QC radius:", cut["cut_radius"])
         print("    Source centerline cell:", cut["source_cell_id"])
 
-        if cut["type"] == "outlet":
-            print("    IsOutlet point ID:", cut["source_point_id"])
+        if cut["type"] in ("outlet", "inlet"):
+            print("    Source terminal point ID:", cut["source_point_id"])
         else:
             print("    Removed cell(s):", cut["removed_cell_ids"])
 
@@ -4937,6 +5559,27 @@ working_surface = clean_polydata(
 
 print("")
 print("Triangulated surface cells:", working_surface.GetNumberOfCells())
+
+# Fail early if the inlet cross-section is already geometrically invalid.
+# Crucially, the previous version did not attempt inlet QC until AFTER every
+# pruning and outlet cut. Also retain *all* rejected inlet loops for ParaView.
+inlet_rejected_debug_records = []
+if inlet_cut_definition is not None and ENABLE_EARLY_INLET_PREFLIGHT:
+    prevalidated_inlet_candidate = preflight_inlet_cut(
+        working_surface, inlet_cut_definition, inlet_rejected_debug_records
+    )
+    if prevalidated_inlet_candidate is not None:
+        prioritize_prevalidated_inlet_cut(
+            inlet_cut_definition, prevalidated_inlet_candidate
+        )
+    else:
+        write_inlet_rejection_debug(inlet_rejected_debug_records)
+        if INLET_PREFLIGHT_FAIL_FAST and REQUIRE_SUCCESSFUL_INLET_CUT:
+            raise RuntimeError(
+                "Early inlet preflight rejected all nine candidate planes. "
+                "Pruning was not started. Inspect the rejected-contour debug "
+                "VTP and the point intersection diagnostics, if generated."
+            )
 
 
 # ============================================================
@@ -5301,6 +5944,60 @@ if VERBOSE_CUT_LOG:
 
 
 # ============================================================
+# STAGE 3: CUT THE INLET HALFWAY TO THE FIRST BIFURCATION
+# ============================================================
+# This operation runs AFTER the existing outlet cuts. Recompute the inlet
+# connectivity anchor on the RETAINED, branchward side before any later
+# connectivity or endpoint-box operation.
+
+accepted_inlet_cut = None
+if inlet_cut_definition is not None:
+    print("")
+    print("============================================")
+    print("STAGE 3: Cutting the inlet")
+    print("============================================")
+    inlet_cut_index = len(pruning_cuts) + len(outlet_cuts)
+    inlet_cut_definition["planned_cut_index"] = inlet_cut_index
+
+    try:
+        (
+            working_surface, loop, _cap, stats, used_cut
+        ) = apply_cut_with_retries(
+            working_surface, inlet_cut_definition, cleanup_result=True,
+            inlet_debug_collector=inlet_rejected_debug_records,
+        )
+        selected_loops.append(
+            annotate_loop(loop, inlet_cut_index, used_cut)
+        )
+        successful_cut_indices.append(inlet_cut_index)
+        accepted_cut_by_index[inlet_cut_index] = dict(used_cut)
+        accepted_inlet_cut = dict(used_cut)
+
+        # The OLD IsInlet point is on the piece we just removed. The new
+        # interior anchor remains safely downstream of every inlet retry.
+        inlet_xyz = inlet_cut_definition["retained_anchor"]
+        exact_cuts_since_global_clean = 0
+        print("Inlet cut accepted at:", used_cut["center"])
+        print("Inlet cut fraction:", used_cut.get(
+            "retry_path_fraction", INLET_CUT_PATH_FRACTION
+        ))
+        print("New inlet connectivity anchor:", inlet_xyz)
+    except Exception as exc:
+        write_inlet_rejection_debug(inlet_rejected_debug_records)
+        if REQUIRE_SUCCESSFUL_INLET_CUT:
+            raise RuntimeError(
+                "Required inlet cut failed after retries. Diagnostic contours "
+                "were saved when a cutter loop was available. No capped "
+                "model or .facenames file was written."
+            ) from exc
+        print("WARNING: Inlet cut failed:", exc)
+    else:
+        if inlet_rejected_debug_records:
+            print("\nInlet retry contour diagnostics:")
+            write_inlet_rejection_debug(inlet_rejected_debug_records)
+
+
+# ============================================================
 # WRITE FAILED/REJECTED CUT-ATTEMPT DEBUG FILE
 # ============================================================
 
@@ -5601,8 +6298,9 @@ if WRITE_CAPPED_OUTPUT:
         final_cap_loops_debug,
     ) = build_final_capped_face_model(
         final_open_for_capping,
-        inlet_xyz,
+        accepted_inlet_cut,
         accepted_cut_by_index,
+        trimmed_centerline,
     )
 
     write_polydata(
@@ -5637,6 +6335,7 @@ print("Pruning cuts completed:", len(pruning_cuts))
 print("IsOutlet cuts planned:", len(outlet_cuts))
 print("IsOutlet cuts completed:", outlet_success_count)
 print("IsOutlet cuts skipped:", outlet_skip_count)
+print("Inlet cut completed:", accepted_inlet_cut is not None)
 print("Final endpoint boxes applied:", end_box_applied_count)
 print("Final endpoint-box locality skips:", end_box_locality_skips)
 
