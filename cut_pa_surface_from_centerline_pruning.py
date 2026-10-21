@@ -3,9 +3,9 @@ import os
 import math
 from collections import defaultdict
 
-# Final refinement: exact VTK clipping + permissive retry/skip +
-# local cross-section shape QC + near-cut triangle-spike QC + open-only
-# mesh-quality cleanup output.
+
+# Refinement version: exact VTK clipping + permissive retry/skip +
+# local cross-section area/shape QC for detecting mangled branch-like caps.
 
 # Refinement: every local cut can retry at nearby positions along its
 # associated centerline branch. In exploratory/permissive mode, a cut that
@@ -23,7 +23,7 @@ FULL_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Net
 TRIMMED_CENTERLINE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Centerline_Trimmed.vtp"
 
 # Original pulmonary artery surface to prune.
-SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\pulmonary_artery_1.vtp"
+SURFACE_FILE = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\JL_Full_Tree_Meshed.vtp"
 
 # Exact-clipped PA tree with the new outlet rings left OPEN.
 # This is the most useful QC output because you can inspect the new
@@ -86,44 +86,41 @@ SIDE_BRANCH_OFFSET_FRACTION = 0.35
 #
 # For side-branch pruning cuts, positive offsets move farther INTO the branch
 # being removed, which remains preferable near a bifurcation crotch.
-PARENTWARD_RETRY_RADIUS_OFFSETS = (
-     0.25,
-     0.50,
-     0.75,
-     1.00,
-     1.50,
-     2.00,
-    -1.25,
-    -3.50,
-    -5.00
-)
-
-# True IsOutlet points get a MUCH more aggressive parentward search.
-# These values are expressed in local vessel radii measured from the
-# originally requested IsOutlet plane.  Positive values move farther
-# upstream toward the parent branch.  This is intentionally about 10x
-# larger than the earlier retry spacing so a problematic distal tip/cap
-# does not cause every retry plane to land in essentially the same place.
-OUTLET_PARENTWARD_RETRY_RADIUS_OFFSETS = (
-     2.50,
-     5.00,
-     7.50,
-    10.00,
-    15.00,
-    20.00,
-    -0.50,
-    -1.00
+TERMINAL_RETRY_RADIUS_OFFSETS = (
+    0.25,
+    0.50,
+    0.75,
+    1.00,
+    1.50,
+    2.00,
 )
 
 SIDE_BRANCH_RETRY_RADIUS_OFFSETS = (
-     0.25,
-     0.50,
-     0.75,
-     1.00,
-     1.50,
-     2.00,
+    0.25,
+    0.50,
+    0.75,
+    1.00,
+    1.50,
+    2.00,
     -0.25,
-    -1.50
+    -1.50,
+)
+
+# True IsOutlet retries are intentionally NOT scaled by endpoint Radius.
+# Some centerline Radius values collapse near old terminal tips, making
+# radius-based retries microscopic.  Instead, retry at fixed fractions of
+# the entire final centerline cell length, measured from the IsOutlet back
+# toward its parent branch.  Only positions farther upstream than the base
+# cut are retained.
+OUTLET_RETRY_PATH_FRACTIONS = (
+    0.10,
+    0.20,
+    0.30,
+    0.40,
+    0.55,
+    0.70,
+    0.85,
+    0.90,
 )
 
 # Never move an alternate plane beyond this fraction of the source polyline
@@ -174,6 +171,10 @@ MAX_LOOP_CENTROID_OFFSET_TO_RADIUS = 1.50
 # VTP so they can be inspected afterward.
 SKIP_FAILED_PRUNING_CUTS = True
 SKIP_FAILED_OUTLET_CUTS = True
+
+# Keep normal runs readable.  Set True only when diagnosing a particular cut.
+VERBOSE_CUT_LOG = False
+PROGRESS_PRINT_EVERY = 50
 
 # If the retained centerline terminates at a pruning junction, make one
 # transverse cut using the last retained branch direction. Positive values
@@ -236,39 +237,6 @@ REGENERATE_GLOBAL_IDS = True
 
 
 # ============================================================
-# LOCAL NEAR-CUT SINGLE-TRIANGLE SPIKE QC
-# ============================================================
-#
-# The global Mesh Quality cleanup catches gross bad elements after the
-# model is finished, but a newly created outlet can sometimes leave one
-# isolated triangle sticking out beside an otherwise acceptable oval cut.
-#
-# Before accepting each candidate cut, inspect the retained-side triangles
-# immediately around that new opening.  If a triangle is exceptionally
-# skinny/long or has one vertex protruding well outside the expected local
-# vessel radius, reject that cut location and let the existing retry logic
-# move the plane farther along the centerline.
-ENABLE_NEAR_CUT_SPIKE_QC = True
-
-# Approximate number of local mesh rings to inspect around the cut.
-# This is implemented geometrically using an axial window sized from the
-# local radius, which is more stable than relying on VTK cell IDs after clip.
-NEAR_CUT_SPIKE_CELL_RINGS = 2
-
-# Conservative local thresholds.  These are intentionally much tighter than
-# the final global 1e5/1e6-type failure threshold because here we are trying
-# to prevent an obviously malformed cap neighborhood before accepting it.
-NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD = 50.0
-NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS = 1.75
-NEAR_CUT_SPIKE_MAX_EDGE_RATIO = 8.0
-
-# Detect the classic single-vertex "spike": one triangle vertex lies far
-# outside the local vessel radius while the other two remain near the vessel.
-NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR = 1.80
-NEAR_CUT_SPIKE_RADIAL_INNER_FACTOR = 1.25
-
-
-# ============================================================
 # FINAL MESH-QUALITY / SPIKE CLEANUP SETTINGS
 # ============================================================
 #
@@ -298,13 +266,9 @@ MESH_QUALITY_THRESHOLD = 1.0e5
 # this string to one of the supported names in configure_mesh_quality_filter().
 MESH_QUALITY_TRIANGLE_MEASURE = "AspectRatio"
 
-# Run the cleanup on the capped model when caps are being written, because
-# cap generation itself can create a rare bad triangle. If capped output is
-# disabled, the cleanup automatically uses the final open surface instead.
-# The final quality-cleaned model is intentionally generated from the OPEN
-# surface only.  The capped model is still written separately for inspection,
-# but caps are never fed into OUTPUT_QUALITY_CLEANED_FILE.
-MESH_QUALITY_CLEANUP_USE_CAPPED_SURFACE = False
+# Mesh-quality cleanup is ALWAYS run on the OPEN surface.  The capped model
+# is written only as an optional diagnostic/output and can never feed back
+# into OUTPUT_QUALITY_CLEANED_FILE.
 
 # Oriented removal box dimensions.  These are HALF-widths expressed as
 # multiples of the local centerline Radius.
@@ -517,22 +481,6 @@ def triangulate_polydata(polydata):
     out.DeepCopy(tri.GetOutput())
 
     return out
-
-
-
-def count_boundary_edges(polydata):
-
-    feature_edges = vtk.vtkFeatureEdges()
-    feature_edges.SetInputData(polydata)
-    feature_edges.BoundaryEdgesOn()
-    feature_edges.FeatureEdgesOff()
-    feature_edges.NonManifoldEdgesOff()
-    feature_edges.ManifoldEdgesOff()
-    feature_edges.Update()
-
-    return int(
-        feature_edges.GetOutput().GetNumberOfCells()
-    )
 
 
 # ============================================================
@@ -759,10 +707,8 @@ def build_cut_retry_candidates(
     candidates = []
     used_distances = [base_distance]
 
-    if base_cut.get("type") == "outlet":
-        retry_offsets = OUTLET_PARENTWARD_RETRY_RADIUS_OFFSETS
-    elif base_cut.get("type") == "terminal":
-        retry_offsets = PARENTWARD_RETRY_RADIUS_OFFSETS
+    if base_cut.get("type") == "terminal":
+        retry_offsets = TERMINAL_RETRY_RADIUS_OFFSETS
     else:
         retry_offsets = SIDE_BRANCH_RETRY_RADIUS_OFFSETS
 
@@ -823,6 +769,93 @@ def build_cut_retry_candidates(
         )
         candidate["retry_distance_from_anchor"] = target_distance
         candidate["retry_radius_offset"] = float(radius_offset)
+
+        candidates.append(candidate)
+        used_distances.append(target_distance)
+
+    return candidates
+
+
+def build_outlet_retry_candidates(
+    centerline,
+    endpoint_entry,
+    base_cut,
+    radius_array
+):
+
+    point_ids = ordered_cell_point_ids_from_endpoint(
+        centerline,
+        endpoint_entry
+    )
+
+    total_length = polyline_total_length(
+        centerline,
+        point_ids
+    )
+
+    if total_length <= PLANE_EPS:
+        return []
+
+    endpoint = point_tuple(
+        centerline,
+        endpoint_entry["point_id"]
+    )
+
+    base_distance = distance(
+        base_cut["center"],
+        endpoint
+    )
+
+    max_distance = total_length * CUT_RETRY_MAX_PATH_FRACTION
+    candidates = []
+    used_distances = [base_distance]
+
+    for path_fraction in OUTLET_RETRY_PATH_FRACTIONS:
+
+        target_distance = min(
+            float(path_fraction) * total_length,
+            max_distance
+        )
+
+        # These retries are specifically intended to move farther toward the
+        # parent branch than the originally requested IsOutlet cut.
+        if target_distance <= base_distance + PLANE_EPS:
+            continue
+
+        if any(
+            abs(target_distance - d) <= PLANE_EPS
+            for d in used_distances
+        ):
+            continue
+
+        sample = sample_centerline_cell_at_distance(
+            centerline,
+            endpoint_entry,
+            target_distance,
+            radius_array
+        )
+
+        if sample is None:
+            continue
+
+        if (
+            sample["radius"] is None
+            or not math.isfinite(sample["radius"])
+            or sample["radius"] <= 0.0
+        ):
+            continue
+
+        candidate = dict(base_cut)
+        candidate["center"] = sample["center"]
+
+        # Sampling proceeds from the IsOutlet back toward its parent, so the
+        # sampled tangent is upstream.  Flip it to preserve the outward cut
+        # normal used by the clipping logic.
+        candidate["normal"] = vec_scale(sample["normal"], -1.0)
+        candidate["radius"] = sample["radius"]
+        candidate["cut_radius"] = sample["radius"] * CUT_RADIUS_FACTOR
+        candidate["retry_distance_from_anchor"] = target_distance
+        candidate["retry_path_fraction"] = float(path_fraction)
 
         candidates.append(candidate)
         used_distances.append(target_distance)
@@ -1324,12 +1357,11 @@ def build_outlet_cut_definitions(trimmed_centerline):
         # farther upstream along the same final centerline cell. The sampled
         # cell direction points upstream, so flip it to keep the cut normal
         # outward/downstream.
-        base_cut["retry_candidates"] = build_cut_retry_candidates(
+        base_cut["retry_candidates"] = build_outlet_retry_candidates(
             trimmed_centerline,
             endpoint_entry,
             base_cut,
-            radius_array,
-            flip_sample_normal=True
+            radius_array
         )
 
         cuts.append(base_cut)
@@ -2277,260 +2309,6 @@ def build_flat_cap(loop):
     return cap
 
 
-
-# ============================================================
-# LOCAL NEAR-CUT SPIKE CHECK
-# ============================================================
-
-def triangle_edge_lengths(surface, cell_id):
-
-    cell = surface.GetCell(cell_id)
-
-    if cell is None or cell.GetNumberOfPoints() != 3:
-        return None
-
-    p0 = point_tuple(surface, cell.GetPointId(0))
-    p1 = point_tuple(surface, cell.GetPointId(1))
-    p2 = point_tuple(surface, cell.GetPointId(2))
-
-    lengths = [
-        distance(p0, p1),
-        distance(p1, p2),
-        distance(p2, p0)
-    ]
-
-    lengths.sort()
-
-    return lengths, (p0, p1, p2)
-
-
-def triangle_area_from_points(p0, p1, p2):
-
-    a = vec_sub(p1, p0)
-    b = vec_sub(p2, p0)
-    return 0.5 * magnitude(cross(a, b))
-
-
-def check_near_cut_single_triangle_spikes(surface, cut, plane):
-
-    if not ENABLE_NEAR_CUT_SPIKE_QC:
-        return {
-            "near_cut_cells_checked": 0,
-            "near_cut_spike_cells": 0
-        }
-
-    local_radius = float(cut.get("radius", 0.0))
-
-    if (
-        not math.isfinite(local_radius)
-        or local_radius <= PLANE_EPS
-    ):
-        return {
-            "near_cut_cells_checked": 0,
-            "near_cut_spike_cells": 0
-        }
-
-    # Inspect only a compact retained-side neighborhood around the new cut.
-    # One "ring" is approximated as roughly half a local radius axially.
-    axial_depth = (
-        max(1, int(NEAR_CUT_SPIKE_CELL_RINGS))
-        * 0.50
-        * local_radius
-    )
-
-    radial_search = (
-        max(
-            NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR,
-            NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
-        )
-        * local_radius
-        * 1.15
-    )
-
-    center = cut["center"]
-
-    bounds = (
-        center[0] - radial_search,
-        center[0] + radial_search,
-        center[1] - radial_search,
-        center[1] + radial_search,
-        center[2] - radial_search,
-        center[2] + radial_search
-    )
-
-    locator = vtk.vtkStaticCellLocator()
-    locator.SetDataSet(surface)
-    locator.BuildLocator()
-
-    candidate_ids = vtk.vtkIdList()
-    locator.FindCellsWithinBounds(bounds, candidate_ids)
-
-    checked = 0
-    spike_ids = []
-    worst_reason = None
-
-    for i in range(candidate_ids.GetNumberOfIds()):
-
-        cell_id = int(candidate_ids.GetId(i))
-
-        edge_data = triangle_edge_lengths(
-            surface,
-            cell_id
-        )
-
-        if edge_data is None:
-            continue
-
-        lengths, pts = edge_data
-        min_edge, mid_edge, max_edge = lengths
-
-        if min_edge <= PLANE_EPS:
-            spike_ids.append(cell_id)
-            worst_reason = (
-                "near-cut triangle has a numerically zero-length edge"
-            )
-            continue
-
-        centroid = (
-            (pts[0][0] + pts[1][0] + pts[2][0]) / 3.0,
-            (pts[0][1] + pts[1][1] + pts[2][1]) / 3.0,
-            (pts[0][2] + pts[1][2] + pts[2][2]) / 3.0
-        )
-
-        signed_centroid = float(
-            plane.EvaluateFunction(centroid)
-        )
-
-        # We only care about the retained/proximal side near the new opening.
-        if (
-            signed_centroid > PLANE_EPS
-            or signed_centroid < -axial_depth
-        ):
-            continue
-
-        centroid_radial = distance_from_axis(
-            centroid,
-            center,
-            cut["normal"]
-        )
-
-        if centroid_radial > radial_search:
-            continue
-
-        checked += 1
-
-        p0, p1, p2 = pts
-        area = triangle_area_from_points(
-            p0,
-            p1,
-            p2
-        )
-
-        # A simple dimensionless triangle aspect indicator.  For an
-        # equilateral triangle this is 1.0; it grows rapidly for slivers.
-        # aspect ~= max_edge^2 / (4*sqrt(3)*Area)
-        if area <= PLANE_EPS:
-            aspect_indicator = float("inf")
-        else:
-            aspect_indicator = (
-                max_edge * max_edge
-                / (4.0 * math.sqrt(3.0) * area)
-            )
-
-        edge_ratio = (
-            max_edge / min_edge
-        )
-
-        max_edge_to_radius = (
-            max_edge / local_radius
-        )
-
-        vertex_radials = [
-            distance_from_axis(
-                p,
-                center,
-                cut["normal"]
-            )
-            for p in pts
-        ]
-
-        vertex_radials.sort()
-
-        one_vertex_spike = (
-            vertex_radials[2]
-            > NEAR_CUT_SPIKE_RADIAL_OVERSHOOT_FACTOR * local_radius
-            and vertex_radials[1]
-            < NEAR_CUT_SPIKE_RADIAL_INNER_FACTOR * local_radius
-        )
-
-        reasons = []
-
-        if (
-            aspect_indicator
-            > NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD
-        ):
-            reasons.append(
-                "local triangle aspect indicator {:.3g} > {:.3g}"
-                .format(
-                    aspect_indicator,
-                    NEAR_CUT_SPIKE_ASPECT_RATIO_THRESHOLD
-                )
-            )
-
-        if (
-            max_edge_to_radius
-            > NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
-        ):
-            reasons.append(
-                "longest edge/local radius {:.3f} > {:.3f}"
-                .format(
-                    max_edge_to_radius,
-                    NEAR_CUT_SPIKE_MAX_EDGE_TO_RADIUS
-                )
-            )
-
-        if (
-            edge_ratio
-            > NEAR_CUT_SPIKE_MAX_EDGE_RATIO
-        ):
-            reasons.append(
-                "triangle edge ratio {:.3f} > {:.3f}"
-                .format(
-                    edge_ratio,
-                    NEAR_CUT_SPIKE_MAX_EDGE_RATIO
-                )
-            )
-
-        if one_vertex_spike:
-            reasons.append(
-                "one vertex protrudes {:.3f} local radii while the other "
-                "vertices remain near the vessel"
-                .format(
-                    vertex_radials[2] / local_radius
-                )
-            )
-
-        if reasons:
-            spike_ids.append(cell_id)
-            worst_reason = "; ".join(reasons)
-
-    if len(spike_ids) > 0:
-        raise SuspiciousCutLoop(
-            "Near-cut single-triangle spike QC rejected this location: "
-            "{} suspect triangle(s) among {} local triangle(s) checked. {}"
-            .format(
-                len(spike_ids),
-                checked,
-                worst_reason if worst_reason is not None else ""
-            )
-        )
-
-    return {
-        "near_cut_cells_checked": checked,
-        "near_cut_spike_cells": 0
-    }
-
-
 # ============================================================
 # EXACT LOCAL PLANE CUT
 #
@@ -2637,17 +2415,6 @@ def apply_exact_local_plane_cut(surface, cut):
     # Remove the internal selection flag before the next cut iteration.
     result.GetCellData().RemoveArray("__TargetCutCell")
 
-    # Reject an otherwise acceptable cut if the newly retained opening has
-    # an isolated sliver/spike triangle immediately beside it.  Raising
-    # SuspiciousCutLoop is intentional: apply_cut_with_retries() will simply
-    # try the next centerline location instead of modifying the surface.
-    near_cut_stats = check_near_cut_single_triangle_spikes(
-        result,
-        cut,
-        plane
-    )
-    stats.update(near_cut_stats)
-
     cap = build_flat_cap(loop)
 
     return result, loop, cap, stats
@@ -2691,11 +2458,16 @@ def apply_cut_with_retries(surface, cut):
             -1
         )
 
-        if attempt_index > 0:
+        if attempt_index > 0 and VERBOSE_CUT_LOG:
 
+            path_fraction = candidate.get("retry_path_fraction", None)
             offset = candidate.get("retry_radius_offset", None)
 
-            if offset is None:
+            if path_fraction is not None:
+                offset_text = "{:.0f}% of branch length toward parent".format(
+                    100.0 * path_fraction
+                )
+            elif offset is None:
                 offset_text = "alternate centerline position"
             elif offset > 0.0:
                 offset_text = "+{:.2f} local radii along cell".format(offset)
@@ -2748,10 +2520,11 @@ def apply_cut_with_retries(surface, cut):
                 )
             )
 
-            print(
-                "    Rejected this plane:",
-                message
-            )
+            if VERBOSE_CUT_LOG:
+                print(
+                    "    Rejected this plane:",
+                    message
+                )
 
             continue
 
@@ -3870,21 +3643,23 @@ if len(all_planned_cuts) == 0:
         "No pruning-boundary cuts or IsOutlet cuts were found."
     )
 
-for i, cut in enumerate(all_planned_cuts):
+if VERBOSE_CUT_LOG:
 
-    print("")
-    print("Planned cut {} / {}".format(i + 1, len(all_planned_cuts)))
-    print("    Type:", cut["type"])
-    print("    Center:", cut["center"])
-    print("    Normal:", cut["normal"])
-    print("    Centerline radius:", cut["radius"])
-    print("    Expected QC radius:", cut["cut_radius"])
-    print("    Source centerline cell:", cut["source_cell_id"])
+    for i, cut in enumerate(all_planned_cuts):
 
-    if cut["type"] == "outlet":
-        print("    IsOutlet point ID:", cut["source_point_id"])
-    else:
-        print("    Removed cell(s):", cut["removed_cell_ids"])
+        print("")
+        print("Planned cut {} / {}".format(i + 1, len(all_planned_cuts)))
+        print("    Type:", cut["type"])
+        print("    Center:", cut["center"])
+        print("    Normal:", cut["normal"])
+        print("    Centerline radius:", cut["radius"])
+        print("    Expected QC radius:", cut["cut_radius"])
+        print("    Source centerline cell:", cut["source_cell_id"])
+
+        if cut["type"] == "outlet":
+            print("    IsOutlet point ID:", cut["source_point_id"])
+        else:
+            print("    Removed cell(s):", cut["removed_cell_ids"])
 
 write_cut_debug_file(
     all_planned_cuts,
@@ -3979,15 +3754,22 @@ for cut_index, cut in enumerate(pruning_cuts):
 
     cut["planned_cut_index"] = cut_index
 
-    print("")
-    print(
-        "Pruning cut {}/{} ({})"
-        .format(
-            cut_index + 1,
-            len(pruning_cuts),
-            cut["type"]
+    if VERBOSE_CUT_LOG:
+        print("")
+        print(
+            "Pruning cut {}/{} ({})"
+            .format(
+                cut_index + 1,
+                len(pruning_cuts),
+                cut["type"]
+            )
         )
-    )
+    elif (cut_index + 1) % PROGRESS_PRINT_EVERY == 0 or cut_index == 0:
+        print(
+            "Pruning progress: {}/{}".format(
+                cut_index + 1, len(pruning_cuts)
+            )
+        )
 
     try:
 
@@ -4018,59 +3800,52 @@ for cut_index, cut in enumerate(pruning_cuts):
             cut_index
         )
 
-        print("    Target loop points:", stats["num_loop_points"])
-        print("    Source triangles intersected:", stats["num_crossing_cells"])
-        print(
-            "    Downstream sacrificial one-ring triangles removed:",
-            stats["num_downstream_neighbor_cells_removed"]
-        )
-        print("    Loop max radial distance:", stats["max_radial"])
-        print("    Loop area:", stats.get("loop_area"))
-        print(
-            "    Area / expected local area:",
-            stats.get("area_ratio")
-        )
-        print("    Loop circularity:", stats.get("circularity"))
-        print(
-            "    Loop radial asymmetry:",
-            stats.get("radial_asymmetry")
-        )
-        print(
-            "    Loop centroid offset from centerline:",
-            stats["centroid_offset"]
-        )
-        if "near_cut_cells_checked" in stats:
+        if VERBOSE_CUT_LOG:
+            print("    Target loop points:", stats["num_loop_points"])
+            print("    Source triangles intersected:", stats["num_crossing_cells"])
             print(
-                "    Near-cut triangles checked for isolated spikes:",
-                stats["near_cut_cells_checked"]
+                "    Downstream sacrificial one-ring triangles removed:",
+                stats["num_downstream_neighbor_cells_removed"]
             )
-        if stats.get("retry_attempt", 0) > 0:
+            print("    Loop max radial distance:", stats["max_radial"])
+            print("    Loop area:", stats.get("loop_area"))
             print(
-                "    Accepted retry attempt:",
-                stats["retry_attempt"] + 1
+                "    Area / expected local area:",
+                stats.get("area_ratio")
+            )
+            print("    Loop circularity:", stats.get("circularity"))
+            print(
+                "    Loop radial asymmetry:",
+                stats.get("radial_asymmetry")
             )
             print(
-                "    Accepted distance from anchor endpoint:",
-                stats["retry_distance_from_anchor"]
+                "    Loop centroid offset from centerline:",
+                stats["centroid_offset"]
             )
-        print(
-            "    Working surface cells after cut:",
-            working_surface.GetNumberOfCells()
-        )
+            if stats.get("retry_attempt", 0) > 0:
+                print(
+                    "    Accepted retry attempt:",
+                    stats["retry_attempt"] + 1
+                )
+                print(
+                    "    Accepted distance from anchor endpoint:",
+                    stats["retry_distance_from_anchor"]
+                )
+            print(
+                "    Working surface cells after cut:",
+                working_surface.GetNumberOfCells()
+            )
 
     except CutRetriesExhausted as exc:
 
         skipped_pruning_cut_indices.append(cut_index)
         failed_cut_attempts.extend(exc.attempts)
 
-        print(
-            "    SKIPPED ENTIRELY after {} failed plane location(s)."
-            .format(len(exc.attempts))
-        )
-        print(
-            "    The surface is left unchanged for this cut so the "
-            "problem can be inspected afterward."
-        )
+        if VERBOSE_CUT_LOG:
+            print(
+                "    SKIPPED ENTIRELY after {} failed plane location(s)."
+                .format(len(exc.attempts))
+            )
 
         if not SKIP_FAILED_PRUNING_CUTS:
             raise
@@ -4085,7 +3860,8 @@ for cut_index, cut in enumerate(pruning_cuts):
         failed_cut_attempts.append(failed_cut)
         skipped_pruning_cut_indices.append(cut_index)
 
-        print("    SKIPPED ENTIRELY because of unexpected cut error:", exc)
+        if VERBOSE_CUT_LOG:
+            print("    SKIPPED ENTIRELY because of unexpected cut error:", exc)
 
         if not SKIP_FAILED_PRUNING_CUTS:
             raise
@@ -4138,15 +3914,26 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
 
     cut["planned_cut_index"] = cut_index
 
-    print("")
-    print(
-        "IsOutlet cut {}/{} (point {})"
-        .format(
-            outlet_local_index + 1,
-            len(outlet_cuts),
-            cut["source_point_id"]
+    if VERBOSE_CUT_LOG:
+        print("")
+        print(
+            "IsOutlet cut {}/{} (point {})"
+            .format(
+                outlet_local_index + 1,
+                len(outlet_cuts),
+                cut["source_point_id"]
+            )
         )
-    )
+    elif (outlet_local_index + 1) % PROGRESS_PRINT_EVERY == 0 or outlet_local_index == 0:
+        print(
+            "IsOutlet progress: {}/{} | completed={} skipped={}"
+            .format(
+                outlet_local_index + 1,
+                len(outlet_cuts),
+                outlet_success_count,
+                outlet_skip_count
+            )
+        )
 
     try:
 
@@ -4179,45 +3966,41 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
 
         outlet_success_count += 1
 
-        print("    Target loop points:", stats["num_loop_points"])
-        print("    Source triangles intersected:", stats["num_crossing_cells"])
-        print(
-            "    Downstream sacrificial one-ring triangles removed:",
-            stats["num_downstream_neighbor_cells_removed"]
-        )
-        print("    Loop max radial distance:", stats["max_radial"])
-        print("    Loop area:", stats.get("loop_area"))
-        print(
-            "    Area / expected local area:",
-            stats.get("area_ratio")
-        )
-        print("    Loop circularity:", stats.get("circularity"))
-        print(
-            "    Loop radial asymmetry:",
-            stats.get("radial_asymmetry")
-        )
-        print(
-            "    Loop centroid offset from centerline:",
-            stats["centroid_offset"]
-        )
-        if "near_cut_cells_checked" in stats:
+        if VERBOSE_CUT_LOG:
+            print("    Target loop points:", stats["num_loop_points"])
+            print("    Source triangles intersected:", stats["num_crossing_cells"])
             print(
-                "    Near-cut triangles checked for isolated spikes:",
-                stats["near_cut_cells_checked"]
+                "    Downstream sacrificial one-ring triangles removed:",
+                stats["num_downstream_neighbor_cells_removed"]
             )
-        if stats.get("retry_attempt", 0) > 0:
+            print("    Loop max radial distance:", stats["max_radial"])
+            print("    Loop area:", stats.get("loop_area"))
             print(
-                "    Accepted retry attempt:",
-                stats["retry_attempt"] + 1
+                "    Area / expected local area:",
+                stats.get("area_ratio")
+            )
+            print("    Loop circularity:", stats.get("circularity"))
+            print(
+                "    Loop radial asymmetry:",
+                stats.get("radial_asymmetry")
             )
             print(
-                "    Accepted distance from outlet endpoint:",
-                stats["retry_distance_from_anchor"]
+                "    Loop centroid offset from centerline:",
+                stats["centroid_offset"]
             )
-        print(
-            "    Working surface cells after cut:",
-            working_surface.GetNumberOfCells()
-        )
+            if stats.get("retry_attempt", 0) > 0:
+                print(
+                    "    Accepted retry attempt:",
+                    stats["retry_attempt"] + 1
+                )
+                print(
+                    "    Accepted distance from outlet endpoint:",
+                    stats["retry_distance_from_anchor"]
+                )
+            print(
+                "    Working surface cells after cut:",
+                working_surface.GetNumberOfCells()
+            )
 
     except CutRetriesExhausted as exc:
 
@@ -4225,15 +4008,11 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
         skipped_outlet_cut_indices.append(cut_index)
         failed_cut_attempts.extend(exc.attempts)
 
-        print(
-            "    SKIPPED ENTIRELY after {} failed plane location(s)."
-            .format(len(exc.attempts))
-        )
-        print(
-            "    This commonly means the branch was already hit by an "
-            "earlier pruning cut, or no clean local cross-section exists "
-            "at the tested positions."
-        )
+        if VERBOSE_CUT_LOG:
+            print(
+                "    SKIPPED ENTIRELY after {} failed plane location(s)."
+                .format(len(exc.attempts))
+            )
 
         if not SKIP_FAILED_OUTLET_CUTS:
             raise
@@ -4245,12 +4024,8 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
             cut_index
         )
 
-        print(
-            "    SKIPPED: no local cross-section was found. "
-            "This outlet was likely removed by the preceding "
-            "pruning-terminal stage."
-        )
-        print("    Reason:", exc)
+        if VERBOSE_CUT_LOG:
+            print("    SKIPPED: no local cross-section was found:", exc)
 
     except Exception as exc:
 
@@ -4261,10 +4036,11 @@ for outlet_local_index, cut in enumerate(outlet_cuts):
         failed_cut["attempt_number"] = 1
         failed_cut_attempts.append(failed_cut)
 
-        print(
-            "    SKIPPED ENTIRELY because of unexpected cut error:",
-            exc
-        )
+        if VERBOSE_CUT_LOG:
+            print(
+                "    SKIPPED ENTIRELY because of unexpected cut error:",
+                exc
+            )
 
         if not SKIP_FAILED_OUTLET_CUTS:
             raise
@@ -4274,11 +4050,12 @@ print("Pruning cuts skipped:", len(skipped_pruning_cut_indices))
 print("IsOutlet cuts completed:", outlet_success_count)
 print("IsOutlet cuts skipped:", outlet_skip_count)
 
-if len(skipped_pruning_cut_indices) > 0:
-    print("Skipped pruning cut indices:", skipped_pruning_cut_indices)
+if VERBOSE_CUT_LOG:
+    if len(skipped_pruning_cut_indices) > 0:
+        print("Skipped pruning cut indices:", skipped_pruning_cut_indices)
 
-if len(skipped_outlet_cut_indices) > 0:
-    print("Skipped IsOutlet cut indices:", skipped_outlet_cut_indices)
+    if len(skipped_outlet_cut_indices) > 0:
+        print("Skipped IsOutlet cut indices:", skipped_outlet_cut_indices)
 
 
 # ============================================================
@@ -4400,9 +4177,8 @@ print(OUTPUT_OPEN_FILE)
 # refined open surface.
 # ============================================================
 
-# The final quality-cleaned model MUST remain open.  Always run the
-# mesh-quality cleanup from final_open.  The capped model below is a separate
-# optional deliverable and is never allowed to replace this input.
+# Quality cleanup always starts from the OPEN surface.  The capped output
+# below is optional and never feeds back into the final cleaned-open model.
 quality_cleanup_input = final_open
 
 if WRITE_CAPPED_OUTPUT:
@@ -4492,10 +4268,6 @@ if WRITE_CAPPED_OUTPUT:
         final_capped_with_normals.GetNumberOfCells()
     )
     print(OUTPUT_CAPPED_FILE)
-
-    # Intentionally do NOT use final_capped_with_normals for mesh-quality
-    # cleanup. OUTPUT_QUALITY_CLEANED_FILE is required to preserve the open
-    # outlet boundaries from final_open.
 
 
 # ============================================================
@@ -4587,10 +4359,6 @@ if ENABLE_MESH_QUALITY_CLEANUP:
         "Remaining cells above quality threshold:",
         remaining_bad_quality_count
     )
-    print(
-        "Open boundary edges in quality-cleaned output:",
-        count_boundary_edges(final_quality_cleaned_with_normals)
-    )
     print(OUTPUT_QUALITY_CLEANED_FILE)
 
 
@@ -4608,9 +4376,5 @@ print("============================================")
 print("FINISHED")
 print("============================================")
 print("")
-print(
-    "Recommended QC order: CUTS_DEBUG_FILE -> "
-    "CUT_LOOPS_DEBUG_FILE -> OUTPUT_OPEN_FILE -> OUTPUT_CAPPED_FILE -> "
-    "BAD_QUALITY_CELLS_DEBUG_FILE -> QUALITY_BOXES_DEBUG_FILE -> "
-    "OUTPUT_QUALITY_CLEANED_FILE"
-)
+print("Primary final output:", OUTPUT_QUALITY_CLEANED_FILE)
+print("Failed-cut debug output:", FAILED_CUT_ATTEMPTS_DEBUG_FILE)
