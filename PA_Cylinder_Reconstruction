@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
 """
-PA_cylindrical_reconstruction.py
+PA_cylindrical_reconstruction_3ring_delaunay.py
 ================================
 Reconstruct a connected, capped 3-D pulmonary artery (PA) surface from a
 *trimmed* VTK centerline (.vtp), without using an existing 3-D vessel surface.
 
 DESIGN
 ------
-  (1) Interpret connected 1-D centerline edges as a rooted graph (IsInlet).
-      Collapse repeated edges but do NOT invent edges between nearby branches.
-  (2) Split the tree at bifurcations and ends. Each directed graph branch is
-      independently lofted through circles oriented perpendicular to its local
-      tangent; at a junction, each outgoing branch gets its own oriented ring.
-  (3) Treat each successive ring pair as a closed tapered tube and combine
-      their NEGATIVE-INSIDE implicit fields by pointwise minimum (union). This
-      produces a true geometric UNION,
-      unlike Delaunay3D on all appended rings, which can bridge empty space.
-  (4) Extract a single union surface with FlyingEdges, attach provisional
-      ModelFaceID + SimVascular .facenames, and save extensive diagnostics.
+  (1) Build a rooted, directed centerline tree from trimmed VMTK lines.
+  (2) At EVERY original centerline point on a branch, create one circular
+      perimeter at Radius, oriented toward the NEXT downstream point.
+      The last ring points along the final upstream->downstream direction.
+  (3) Append the EXACT circle points for each local group of three rings,
+      e.g. (0,1,2), (1,2,3), (2,3,4). Use vtkDelaunay3D, followed by
+      vtkDataSetSurfaceFilter, to form ONE local, capped 3-ring volume.
+      Groups overlap to remove gaps. At branch points, daughter groups are
+      separately constructed with their own downstream-oriented rings.
+  (4) Rasterize the signed distance to EACH closed Delaunay hull locally,
+      take the UNION of the local solids, and extract a single surface.
+      There is NO global Delaunay over multiple branches.
+  (5) Attach approximate inlet/outlet face IDs and extensive diagnostics.
 
-IMPORTANT:
-- This is an INITIAL reconstruction approach. The implicit union is voxelized:
-  terminal caps are nearly planar, not mathematically exact planes. Review
-  cap-to-wall labels and topology before Gmsh / SimVascular meshing.
-- Radius values (including clamped values) are in the units of the source VTP.
-- Delaunay3D is intentionally NOT used globally. The ring loft is a QUAD-strip
-  surface triangulation; disconnected tubes only meet during the implicit union.
-- A *trimmed* centerline is required. The script does not choose which anatomical
-  branches should be discarded, and does not perform clot subtraction.
+NOTES:
+- Delaunay3D fills the CONVEX HULL of each local 3-ring point cloud.
+  The middle ring influences the hull only where it lies on the convex envelope;
+  this is deliberate for the requested experiment, but tight bends can bulge.
+- The final union is voxelized. Terminal caps are approximate and face IDs
+  should be checked before CFD meshing.
+- The script requires a regular Python environment (NumPy, SciPy, VTK).
 
 Run:
-  python PA_cylindrical_reconstruction.py
-  python PA_cylindrical_reconstruction.py --input /path/to/trimmed.vtp \
-      --output-dir /path/to/PA_cylindrical_output --spacing 0.7
+  python PA_cylindrical_reconstruction_3ring_delaunay.py \
+    --input /path/to/trimmed.vtp --output-dir /path/to/output
 
 Requirements: numpy, scipy, vtk. Python 3.9+ (including 3.12).
 """
@@ -54,7 +53,9 @@ import vtk
 from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
 
 # ======================== USER CONFIGURATION ================================
-CENTERLINE_VTP = r"JL_Centerline_Trimmed.vtp"  # <--- CHANGE TO YOUR TRIMMED VTP
+File_location = r"/home/cgrladmin/Simvascular/JL_9-gen-test_Circles"
+
+CENTERLINE_VTP = File_location + "/JL_9-gen-centerlines.vtp"  # <--- CHANGE TO YOUR TRIMMED VTP
 OUTPUT_DIR = r"PA_cylindrical_reconstruction"
 
 RADIUS_ARRAY_CANDIDATES = ("Radius", "MaximumInscribedSphereRadius")
@@ -69,12 +70,25 @@ MIN_CENTERLINE_STEP = 1.0e-7
 RADIUS_FLOOR_ABSOLUTE = 0.35     # use 0 to disable; identical units to VTP
 RADIUS_FLOOR_MEDIAN_FACTOR = 0.0 # optionally e.g. 0.1, applied in addition
 
+# Delaunay3D THREE-RING SETTINGS
+# Stride 1: (0,1,2), (1,2,3), (2,3,4) -- two shared rings.
+# Stride 2: (0,1,2), (2,3,4), (4,5,6) -- one shared ring.
+THREE_RING_STRIDE = 1
+# False = one ring at EACH ORIGINAL centerline point (your requested design).
+# True = also insert rings along long centerline segments, to control hull span.
+RESAMPLE_CENTERLINE = False
+# vtkDelaunay3D tolerance relative to the local point cloud bbox diagonal.
+DELAUNAY_TOLERANCE = 0.001
+# Alpha 0 = full convex hull; positive values can make holes and are not used.
+DELAUNAY_ALPHA = 0.0
+WRITE_THREE_RING_DEBUG = True
+
 # An implicit UNION makes branch intersections well-defined and avoids the
 # need to choose a triangulation spanning an entire group of circles.
 VOXEL_SPACING = 0.65
 MAX_GRID_VOXELS = 50_000_000      # safety cap, auto-coarsen if too large
 AUTO_COARSEN_GRID = True
-SURFACE_BLUR_SIGMA_VOXELS = 0.45  # 0 = no smoothing of signed distance field
+SURFACE_BLUR_SIGMA_VOXELS = 0.20  # 0 = no smoothing of signed distance field
 GRID_PADDING_RADII = 1.5
 GRID_PADDING_VOXELS = 5
 
@@ -356,46 +370,127 @@ def _resample_path(graph: Graph, path):
     return np.asarray(xyz_new, dtype=np.float64), np.asarray(rad_new, dtype=np.float64)
 
 
-def _tube_mesh(centers, radii, resolution):
-    """Build a closed manifold tube with separate cross-section rings."""
-    k = len(centers)
-    if k < 2:
-        raise RuntimeError('Need 2 or more ring centers to loft a tube')
+def _three_ring_group_ranges(num_rings, stride=None):
+    """Overlapping actual 3-ring groups, covering EVERY centerline interval.
+
+    Stride 1: (0,1,2), (1,2,3), (2,3,4), ...
+    Stride 2: (0,1,2), (2,3,4), ...; append final (n-3,n-2,n-1)
+    if needed to avoid losing a terminal interval.
+    A 2-point branch has one 2-ring fallback.
+    """
+    stride = THREE_RING_STRIDE if stride is None else int(stride)
+    if stride not in (1, 2):
+        raise ValueError('THREE_RING_STRIDE must be 1 or 2')
+    if num_rings < 2:
+        return []
+    if num_rings == 2:
+        return [(0, 1)]
+    starts = list(range(0, num_rings-2, stride))
+    last = num_rings-3
+    if starts[-1] != last:
+        starts.append(last)
+    return [tuple(range(i, i+3)) for i in sorted(set(starts))]
+
+
+def _branch_rings(centers, radii, resolution):
+    """Make each REAL centerline circle once; reuse it in overlapping groups.
+
+    Normal at ring i points from center i to center i+1. The last ring
+    uses the last upstream->downstream direction. The transported radial
+    basis prevents arbitrary rotation between neighboring rings.
+    """
+    c = np.asarray(centers, dtype=np.float64)
+    r = np.asarray(radii, dtype=np.float64)
+    if len(c) < 2:
+        raise ValueError('At least two centers are required')
     n = int(resolution)
-    theta = np.arange(n) * (2.0*np.pi/n)
-    c,s = np.cos(theta),np.sin(theta)
-    pts = np.empty((k*n+2,3), dtype=np.float64)
-    ring_lines = []
-    tangents = np.empty_like(centers)
-    tangents[0] = _unit(centers[1]-centers[0])
-    tangents[-1] = _unit(centers[-1]-centers[-2])
-    for j in range(1,k-1):
-        tangents[j] = _unit(_unit(centers[j]-centers[j-1]) + _unit(centers[j+1]-centers[j]), tangents[j-1])
-    axis = None
-    for i in range(k):
-        ax, ay = _rmf_basis(tangents[i], axis)
-        axis = ax
-        pts[i*n:(i+1)*n] = centers[i][None,:] + radii[i] * (c[:,None]*ax[None,:] + s[:,None]*ay[None,:])
-        ring_lines.append(pts[i*n:(i+1)*n].copy())
-    pts[k*n] = centers[0]
-    pts[k*n+1] = centers[-1]
-    tris = []
-    for j in range(k-1):
-        for i in range(n):
-            a=j*n+i; b=j*n+(i+1)%n; cc=(j+1)*n+(i+1)%n; d=(j+1)*n+i
-            tris.extend(((a,b,cc),(a,cc,d)))
-    for i in range(n):
-        tris.append((k*n, (i+1)%n, i))
-        tris.append((k*n+1, (k-1)*n+i, (k-1)*n+(i+1)%n))
-    face_np=np.asarray(tris, dtype=np.int64)
-    vtkpoints=vtk.vtkPoints();vtkpoints.SetData(numpy_to_vtk(pts,deep=True))
-    vtkcells=vtk.vtkCellArray()
-    vtkcells.SetData(
-        numpy_to_vtkIdTypeArray(np.arange(0, 3*(len(face_np)+1), 3, dtype=np.int64), deep=True),
-        numpy_to_vtkIdTypeArray(face_np.ravel(), deep=True)
-    )
-    mesh=vtk.vtkPolyData();mesh.SetPoints(vtkpoints);mesh.SetPolys(vtkcells)
-    return mesh,ring_lines
+    t = np.arange(n, dtype=np.float64)*(2*np.pi/n)
+    cs, sn = np.cos(t), np.sin(t)
+    rings = []
+    last_axis = None
+    for i in range(len(c)):
+        direction = (c[i+1]-c[i]) if i < len(c)-1 else (c[i]-c[i-1])
+        x,y = _rmf_basis(direction,last_axis)
+        last_axis = x
+        ring = c[i][None,:] + r[i]*(cs[:,None]*x[None,:]+sn[:,None]*y[None,:])
+        rings.append(np.asarray(ring,dtype=np.float64))
+    return rings
+
+
+def _delaunay_ring_hull(rings):
+    """Append 2 or 3 point clouds, Delaunay3D, extract their outer hull."""
+    if len(rings) not in (2, 3):
+        raise ValueError('Local Delaunay requires exactly 2 or 3 rings')
+    flat = np.vstack(rings).astype(np.float64)
+    if not np.all(np.isfinite(flat)):
+        raise RuntimeError('Non-finite circle coordinate')
+    pts=vtk.vtkPoints()
+    pts.SetData(numpy_to_vtk(flat,deep=True))
+    cloud=vtk.vtkPolyData()
+    cloud.SetPoints(pts)
+    # Explicit vertices make the appended point cloud valid PolyData, without
+    # creating any triangle/quads across ring boundaries before Delaunay3D.
+    verts=vtk.vtkCellArray()
+    for i in range(len(flat)):
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(i)
+    cloud.SetVerts(verts)
+    delaunay=vtk.vtkDelaunay3D()
+    delaunay.SetInputData(cloud)
+    delaunay.SetTolerance(float(DELAUNAY_TOLERANCE))
+    delaunay.SetAlpha(float(DELAUNAY_ALPHA))
+    delaunay.BoundingTriangulationOff()
+    delaunay.Update()
+    tet_count = delaunay.GetOutput().GetNumberOfCells()
+    if tet_count == 0:
+        raise RuntimeError('vtkDelaunay3D produced no tetrahedral cells')
+    surface=vtk.vtkDataSetSurfaceFilter()
+    surface.SetInputConnection(delaunay.GetOutputPort())
+    surface.Update()
+    tri=vtk.vtkTriangleFilter()
+    tri.SetInputConnection(surface.GetOutputPort())
+    tri.Update()
+    clean=vtk.vtkCleanPolyData()
+    clean.SetInputConnection(tri.GetOutputPort())
+    clean.SetTolerance(0.0)
+    clean.Update()
+    normals=vtk.vtkPolyDataNormals()
+    normals.SetInputConnection(clean.GetOutputPort())
+    normals.ConsistencyOn()
+    normals.AutoOrientNormalsOn()
+    normals.SplittingOff()
+    normals.ComputeCellNormalsOn()
+    normals.ComputePointNormalsOff()
+    normals.Update()
+    result=vtk.vtkPolyData()
+    result.DeepCopy(normals.GetOutput())
+    if result.GetNumberOfPolys() == 0:
+        raise RuntimeError('Delaunay hull has zero surface triangles')
+    topo = _topology(result)
+    if topo['boundary_edges'] or topo['nonmanifold_edges'] or topo['connected_regions']!=1:
+        raise RuntimeError('Delaunay hull topology invalid: '+str(topo))
+    # Inward/outward signed distance is tested at a center of the middle ring.
+    probe=np.mean(rings[len(rings)//2],axis=0)
+    implicit=vtk.vtkImplicitPolyDataDistance()
+    implicit.SetInput(result)
+    sign=float(implicit.EvaluateFunction(probe))
+    if sign > 0:
+        reverse=vtk.vtkReverseSense()
+        reverse.SetInputData(result)
+        reverse.ReverseCellsOn()
+        reverse.ReverseNormalsOn()
+        reverse.Update()
+        result2=vtk.vtkPolyData()
+        result2.DeepCopy(reverse.GetOutput())
+        implicit2=vtk.vtkImplicitPolyDataDistance()
+        implicit2.SetInput(result2)
+        if implicit2.EvaluateFunction(probe) < sign:
+            result=result2
+    return result, {'input_ring_count':len(rings),
+                    'input_cloud_points':len(flat),
+                    'delaunay_volume_cells':int(tet_count),
+                    'hull_surface_triangles':int(result.GetNumberOfPolys()),
+                    'hull_topology':topo}
 
 
 def _make_debug_rings(rings):
@@ -430,18 +525,11 @@ def _vtk_image_from_array(field, xyz_min, spacing):
 
 
 def _implicit_union(branch_meshes, g: Graph):
-    """Union all consecutive pairs of oriented circular cross sections.
+    """Rasterize and union the ACTUAL outer surfaces from local Delaunay3D.
 
-    This is an ANALYTIC implicit description of a closed truncated cone / tube
-    between each pair of circles. The frustum's cross section at axial t has
-    radius (1-t)*r0+t*r1. Two finite cap planes stop the volume at t=0,1.
-    Each frustum is *independent*, so even pathological long-branch lofts
-    cannot produce self-intersecting side triangles here. The final shape is
-    the minimum of all local implicit fields, never a global Delaunay mesh.
-
-    The branch VTPs remain saved as debug geometry, but the union itself does
-    not depend on vtkImplicitPolyDataDistance (which can misclassify winding
-    on folded polylines and can be prohibitively slow for thousands of rings).
+    Unlike the previous implementation, this DOES NOT approximate the groups
+    using consecutive two-ring cylinders. Each group's closed Delaunay hull
+    contributes its signed distance directly to the common grid.
     """
     tree_points=np.array(sorted(g.tree_nodes),dtype=int)
     p=g.xyz[tree_points];r=g.radius[tree_points]
@@ -455,7 +543,7 @@ def _implicit_union(branch_meshes, g: Graph):
     nv=int(np.prod(shape_xyz.astype(np.int64)))
     if nv>MAX_GRID_VOXELS:
         if not AUTO_COARSEN_GRID:
-            raise MemoryError(f'Grid would require {nv:,} samples; increase VOXEL_SPACING.')
+            raise MemoryError(f'Grid requires {nv:,} samples; increase VOXEL_SPACING')
         spacing*=max(1.01,(nv/MAX_GRID_VOXELS)**(1/3)*1.03)
         shape_xyz=np.ceil((upper-lower)/spacing).astype(int)+1
         nv=int(np.prod(shape_xyz.astype(np.int64)))
@@ -463,70 +551,73 @@ def _implicit_union(branch_meshes, g: Graph):
             spacing*=1.03
             shape_xyz=np.ceil((upper-lower)/spacing).astype(int)+1
             nv=int(np.prod(shape_xyz.astype(np.int64)))
-        print(f'WARNING: grid auto-coarsened to {spacing:.6g}; thin branches may disappear.')
-    print(f'Implicit union grid: dims={tuple(map(int,shape_xyz))} samples={nv:,} '
-          f'spacing={spacing:.6g}; field ~{4*nv/1e6:.1f} MB')
+        print(f'WARNING: grid auto-coarsened to {spacing:.6g}')
+    print(f'Delaunay volume union grid: dims={tuple(map(int,shape_xyz))} '
+          f'samples={nv:,} spacing={spacing:.6g}; field ~{4*nv/1e6:.1f} MB')
     shape=(int(shape_xyz[2]),int(shape_xyz[1]),int(shape_xyz[0]))
     field=np.full(shape,np.float32(maxr*4+10*spacing),dtype=np.float32)
-    npieces=sum(len(centers)-1 for _,centers,_ in branch_meshes)
     diag=[]
-    count=0
-    for bid,(_mesh,centers,radii) in enumerate(branch_meshes):
-        for j in range(len(centers)-1):
-            a=centers[j];b=centers[j+1]
-            ra=float(radii[j]);rb=float(radii[j+1])
-            axis=b-a
-            length=_norm(axis)
-            if length<MIN_CENTERLINE_STEP:
-                continue
-            axis=axis/length
-            expand=max(ra,rb)+3*spacing
-            mn=np.minimum(a,b)-expand
-            mx=np.maximum(a,b)+expand
-            lo=np.maximum(0,np.floor((mn-lower)/spacing).astype(int))
-            hi=np.minimum(shape_xyz-1,np.ceil((mx-lower)/spacing).astype(int))
-            if np.any(hi<lo):
-                continue
-            x=(lower[0]+np.arange(lo[0],hi[0]+1)*spacing)[None,None,:]
-            y=(lower[1]+np.arange(lo[1],hi[1]+1)*spacing)[None,:,None]
-            # Constrain temporary arrays to z-slabs for large proximate trunks.
-            for z0 in range(int(lo[2]),int(hi[2])+1,16):
-                z1=min(int(hi[2]),z0+15)
-                z=(lower[2]+np.arange(z0,z1+1)*spacing)[:,None,None]
-                axial=(x-a[0])*axis[0]+(y-a[1])*axis[1]+(z-a[2])*axis[2]
-                # Each cross section is perpendicular to this edge's direction.
-                radial=np.sqrt(
-                    ((x-a[0])-axial*axis[0])**2 +
-                    ((y-a[1])-axial*axis[1])**2 +
-                    ((z-a[2])-axial*axis[2])**2
-                )
-                t=np.clip(axial/length,0.0,1.0)
-                radius=ra+(rb-ra)*t
-                # Max of side and planar-end constraints: negative INSIDE.
-                local=np.maximum(np.maximum(radial-radius,-axial),axial-length)
-                sl=np.s_[z0:z1+1,lo[1]:hi[1]+1,lo[0]:hi[0]+1]
-                np.minimum(field[sl],local.astype(np.float32),out=field[sl])
-            diag.append({'piece_id':count,'branch_id':bid,'centerline_ring_pair':j,
-                         'length':float(length),'start_radius':ra,'end_radius':rb})
-            count+=1
-        if (bid+1)%10==0 or bid==0 or bid+1==len(branch_meshes):
-            print(f'  implicit union branches {bid+1}/{len(branch_meshes)} '
-                  f'({count}/{npieces} ring-pair pieces)')
+    for pid,(mesh,centers,radii,meta) in enumerate(branch_meshes):
+        bounds=np.asarray(mesh.GetBounds(),dtype=np.float64)
+        bmin=bounds[[0,2,4]]
+        bmax=bounds[[1,3,5]]
+        lo=np.maximum(0,np.floor((bmin-3*spacing-lower)/spacing).astype(int))
+        hi=np.minimum(shape_xyz-1,np.ceil((bmax+3*spacing-lower)/spacing).astype(int))
+        if np.any(hi<lo):
+            continue
+        imp=vtk.vtkImplicitPolyDataDistance()
+        imp.SetInput(mesh)
+        nx,ny,nz = (hi-lo+1).astype(int)
+        # vtkSampleFunction calls the C++ signed-distance evaluator in a
+        # single operation, with the sample lattice exactly aligned to the
+        # global field's voxel positions. No Python per-voxel loops.
+        sampler=vtk.vtkSampleFunction()
+        sampler.SetImplicitFunction(imp)
+        sampler.SetModelBounds(
+            float(lower[0]+lo[0]*spacing),float(lower[0]+hi[0]*spacing),
+            float(lower[1]+lo[1]*spacing),float(lower[1]+hi[1]*spacing),
+            float(lower[2]+lo[2]*spacing),float(lower[2]+hi[2]*spacing))
+        sampler.SetSampleDimensions(int(nx),int(ny),int(nz))
+        sampler.ComputeNormalsOff()
+        sampler.Update()
+        vals=vtk_to_numpy(sampler.GetOutput().GetPointData().GetScalars())
+        local=vals.reshape((nz,ny,nx)).astype(np.float32,copy=False)
+        sl=np.s_[lo[2]:hi[2]+1,lo[1]:hi[1]+1,lo[0]:hi[0]+1]
+        np.minimum(field[sl],local,out=field[sl])
+        diag.append({'branch_id':meta['branch_id'],'loft_group_id':meta['group_id'],
+                     'source_ring_indices':str(meta['source_ring_indices']),
+                     'sampled_voxels':int(local.size),
+                     'local_hull_triangles':int(mesh.GetNumberOfPolys())})
+        if (pid+1)%25==0 or pid==0 or pid+1==len(branch_meshes):
+            print(f'  rasterized Delaunay hulls: {pid+1}/{len(branch_meshes)}')
     if SURFACE_BLUR_SIGMA_VOXELS>0:
         field=ndimage.gaussian_filter(field,SURFACE_BLUR_SIGMA_VOXELS,
                                       mode='nearest',output=np.float32)
     image=_vtk_image_from_array(field,lower,spacing)
-    contour=vtk.vtkFlyingEdges3D();contour.SetInputData(image)
-    contour.SetValue(0,0.0);contour.Update()
+    contour=vtk.vtkFlyingEdges3D()
+    contour.SetInputData(image)
+    contour.SetValue(0,0.0)
+    contour.Update()
     raw=contour.GetOutput()
     if raw.GetNumberOfPolys()==0:
-        raise RuntimeError('Implicit union generated no surface: adjust voxel spacing')
-    clean=vtk.vtkCleanPolyData();clean.SetInputData(raw);clean.SetTolerance(0);clean.Update()
-    tri=vtk.vtkTriangleFilter();tri.SetInputConnection(clean.GetOutputPort());tri.Update()
-    norms=vtk.vtkPolyDataNormals();norms.SetInputConnection(tri.GetOutputPort())
-    norms.ConsistencyOn();norms.AutoOrientNormalsOn();norms.SplittingOff()
-    norms.ComputeCellNormalsOn();norms.ComputePointNormalsOff();norms.Update()
-    surface=vtk.vtkPolyData();surface.DeepCopy(norms.GetOutput())
+        raise RuntimeError('Delaunay group union generated no surface')
+    clean=vtk.vtkCleanPolyData()
+    clean.SetInputData(raw)
+    clean.SetTolerance(0)
+    clean.Update()
+    tri=vtk.vtkTriangleFilter()
+    tri.SetInputConnection(clean.GetOutputPort())
+    tri.Update()
+    norms=vtk.vtkPolyDataNormals()
+    norms.SetInputConnection(tri.GetOutputPort())
+    norms.ConsistencyOn()
+    norms.AutoOrientNormalsOn()
+    norms.SplittingOff()
+    norms.ComputeCellNormalsOn()
+    norms.ComputePointNormalsOff()
+    norms.Update()
+    surface=vtk.vtkPolyData()
+    surface.DeepCopy(norms.GetOutput())
     return surface,image,spacing,diag
 
 
@@ -696,117 +787,184 @@ def _export_boundary_surfaces(surface,mapping,outdir):
 
 
 def reconstruct(input_path, output_dir):
-    input_path=Path(input_path).expanduser().resolve()
-    output_dir=Path(output_dir).expanduser().resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f'Centerline file not found: {input_path}')
+    """Run actual sliding 3-ring Delaunay reconstruction."""
+    input_path=Path(input_path)
+    output_dir=Path(output_dir)
     output_dir.mkdir(parents=True,exist_ok=True)
-    reader=vtk.vtkXMLPolyDataReader();reader.SetFileName(str(input_path));reader.Update()
+    reader=vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(str(input_path))
+    reader.Update()
     poly=reader.GetOutput()
     if poly.GetNumberOfLines()==0:
-        raise RuntimeError('Expected a centerline VTP containing polyline cells, not a surface')
+        raise RuntimeError('Expected a centerline VTP with polyline cells')
     print('Reading trimmed centerlines:',input_path)
     graph=_make_graph(poly)
     print('Graph:',json.dumps(graph.stats,indent=2))
-    meshes=[];debug_rings=[];tube_append=vtk.vtkAppendPolyData();summary=[]
-    for index,path in enumerate(graph.branches):
-        centers,radii=_resample_path(graph,path)
+    meshes=[]
+    debug_rings=[]
+    group_debug_rings=[]
+    tube_append=vtk.vtkAppendPolyData()
+    summary=[];group_rows=[]
+    num_three=0;num_pairs=0
+    for branch_idx,path in enumerate(graph.branches):
+        if RESAMPLE_CENTERLINE:
+            centers,radii=_resample_path(graph,path)
+        else:
+            centers=graph.xyz[np.asarray(path,dtype=int)].copy()
+            radii=graph.radius[np.asarray(path,dtype=int)].copy()
         if len(centers)<2:
             continue
-        tube,rings=_tube_mesh(centers,radii,CIRCLE_RESOLUTION)
-        # Tube mesh per path, never global all-rings Delaunay.
-        meshes.append((tube,centers,radii))
-        if WRITE_UNMERGED_TUBES:
-            label=vtk.vtkIntArray();label.SetName('BranchID')
-            label.SetNumberOfTuples(tube.GetNumberOfCells());label.Fill(index)
-            tube.GetCellData().AddArray(label)
-            tube_append.AddInputData(tube)
+        # Reuse EXACT same ring coordinates in all overlapping Delaunay groups.
+        all_rings=_branch_rings(centers,radii,CIRCLE_RESOLUTION)
         if WRITE_RING_DEBUG:
-            debug_rings.append((index,rings))
+            debug_rings.append((branch_idx,all_rings))
+        groups=_three_ring_group_ranges(len(centers))
+        for group_idx,indices in enumerate(groups):
+            grouped_rings=[all_rings[k] for k in indices]
+            hull,details=_delaunay_ring_hull(grouped_rings)
+            meta={'branch_id':branch_idx,'group_id':group_idx,
+                  'source_ring_indices':indices,**details}
+            meshes.append((hull,centers[np.asarray(indices)],
+                           radii[np.asarray(indices)],meta))
+            if len(indices)==3: num_three+=1
+            else: num_pairs+=1
+            if WRITE_UNMERGED_TUBES:
+                for arr_name,val in [('BranchID',branch_idx),('LoftGroupID',group_idx)]:
+                    label=vtk.vtkIntArray()
+                    label.SetName(arr_name)
+                    label.SetNumberOfTuples(hull.GetNumberOfCells())
+                    label.Fill(val)
+                    hull.GetCellData().AddArray(label)
+                tube_append.AddInputData(hull)
+            if WRITE_RING_DEBUG and WRITE_THREE_RING_DEBUG:
+                group_debug_rings.append((branch_idx,grouped_rings))
+            group_rows.append({
+                'branch_id':branch_idx,'group_id':group_idx,
+                'source_ring_indices':str(indices),
+                'source_ring_count':len(indices),
+                'ring1_center':str(centers[indices[0]].tolist()),
+                'ring2_center':str(centers[indices[1]].tolist()),
+                'ring3_center':str(centers[indices[2]].tolist()) if len(indices)==3 else '',
+                'start_radius':float(radii[indices[0]]),
+                'end_radius':float(radii[indices[-1]]),
+                'method':'VTK_DELAUNAY3D',
+                'input_cloud_points':details['input_cloud_points'],
+                'delaunay_volume_cells':details['delaunay_volume_cells'],
+                'hull_surface_triangles':details['hull_surface_triangles'],
+                'boundary_edges':details['hull_topology']['boundary_edges'],
+                'nonmanifold_edges':details['hull_topology']['nonmanifold_edges'],
+                })
         start,end=path[0],path[-1]
-        summary.append({'branch_id':index,'start_point_id':start,'end_point_id':end,
-                        'start_x':graph.xyz[start,0],'start_y':graph.xyz[start,1],'start_z':graph.xyz[start,2],
-                        'end_x':graph.xyz[end,0],'end_y':graph.xyz[end,1],'end_z':graph.xyz[end,2],
-                        'num_centerline_points':len(path),'num_loft_rings':len(centers),
+        summary.append({'branch_id':branch_idx,
+                        'start_point_id':start,'end_point_id':end,
+                        'start_x':graph.xyz[start,0],
+                        'start_y':graph.xyz[start,1],
+                        'start_z':graph.xyz[start,2],
+                        'end_x':graph.xyz[end,0],
+                        'end_y':graph.xyz[end,1],
+                        'end_z':graph.xyz[end,2],
+                        'num_centerline_points':len(path),
+                        'num_loft_rings':len(centers),
+                        'three_ring_groups':sum(len(t)==3 for t in groups),
+                        'two_ring_fallbacks':sum(len(t)==2 for t in groups),
                         'length':float(sum(_norm(b-a) for a,b in zip(centers[:-1],centers[1:]))),
                         'minimum_radius':float(np.min(radii)),
                         'maximum_radius':float(np.max(radii)),
                         'starts_at_junction':len(graph.children[start])>=2,
                         'ends_at_junction':len(graph.children[end])>=2})
     if not meshes:
-        raise RuntimeError('No reconstructible branches were found')
+        raise RuntimeError('No reconstructible branches found')
     _write_csv(output_dir/'branch_summary.csv',summary,list(summary[0]))
+    _write_csv(output_dir/'three_ring_loft_groups.csv',group_rows,list(group_rows[0]))
     if WRITE_UNMERGED_TUBES:
         tube_append.Update()
+        _write_vtp(tube_append.GetOutput(),output_dir/'individual_delaunay_hulls_DEBUG_ONLY.vtp')
         _write_vtp(tube_append.GetOutput(),output_dir/'individual_lofted_tubes_DEBUG_ONLY.vtp')
     if WRITE_RING_DEBUG:
         _write_vtp(_make_debug_rings(debug_rings),output_dir/'oriented_cross_section_rings.vtp')
-    print('Constructed',len(meshes),'independent branch loft previews;',
-          'combining successive ring pairs through an implicit geometric UNION')
+        if WRITE_THREE_RING_DEBUG and group_debug_rings:
+            _write_vtp(_make_debug_rings(group_debug_rings),
+                       output_dir/'three_ring_group_circles.vtp')
+    print(f'Constructed {len(meshes)} independent local Delaunay3D hulls '
+          f'({num_three} 3-ring, {num_pairs} 2-ring fallback)')
+    print('Unioning ACTUAL local Delaunay3D hull surfaces; no two-ring frustum interpolation')
     surface,image,spacing,union_diag=_implicit_union(meshes,graph)
     if WRITE_UNION_DISTANCE_FIELD_VTI:
         _write_vti(image,output_dir/'union_signed_distance.vti')
-    initial_quality=_topology(surface)
-    print('Union topology:',initial_quality)
+    initial_topology=_topology(surface)
+    print('Union topology:',initial_topology)
     surface,island_report=_remove_tiny_islands(surface,output_dir)
-    mapping, cap_diag=_label_caps(surface,graph,spacing)
+    mapping,cap_diag=_label_caps(surface,graph,spacing)
     path_out=output_dir/'PA_cylindrical_reconstructed_closed.vtp'
     _write_vtp(surface,path_out)
     _write_facenames(Path(str(path_out)+'.facenames'),mapping)
     _write_csv(output_dir/'terminal_cap_report.csv',cap_diag,list(cap_diag[0]))
     _export_boundary_surfaces(surface,mapping,output_dir/'face_surfaces_preview')
-    final_quality=_topology(surface)
-    surface_quality=_surface_quality_summary(surface)
-    report={'input':str(input_path),'output':str(path_out),'graph':graph.stats,
-            'loft_tubes':len(meshes),'circle_resolution':CIRCLE_RESOLUTION,
+    final_topology=_topology(surface)
+    quality=_surface_quality_summary(surface)
+    report={'input':str(input_path),'output':str(path_out),
+            'graph':graph.stats,'loft_groups':len(meshes),'loft_tubes':len(meshes),
+            'three_ring_grouping':{
+                'method':'vtkDelaunay3D on appended local three-ring point clouds',
+                'stride':THREE_RING_STRIDE,
+                'resample_centerline':RESAMPLE_CENTERLINE,
+                'three_ring_groups':num_three,'two_ring_fallback_groups':num_pairs,
+                'convex_hull_note':'local Delaunay builds a convex hull; high-curvature shapes may bulge'},
+            'circle_resolution':CIRCLE_RESOLUTION,
             'voxel_spacing_requested':VOXEL_SPACING,'voxel_spacing_used':spacing,
-            'implicit_union':{'tube_sample_roi':union_diag},
-            'topology':final_quality,'surface_quality':surface_quality,
+            'implicit_union':{'local_delaunay_mesh_roi':union_diag},
+            'topology':final_topology,'surface_quality':quality,
             'island_cleanup':island_report,'face_names':mapping,
             'terminal_caps':cap_diag,
             'warnings':[
-              'Implicit surface terminal caps are voxel-approximated, not mathematically flat.',
-              'ModelFaceID cap labeling is geometric and requires visual verification.',
-              'Watertight edge topology does NOT rule out self-intersection or inversion.',
-              'This output is a surface candidate, NOT a certified Gmsh/SimVascular volume mesh.'
-            ]}
+                'Delaunay3D hulls are convex; inspect turns for artificial volume.',
+                'Terminal caps are voxel-approximated rather than exactly planar.',
+                'ModelFaceID cap labels are geometric matches and need visual verification.',
+                'Watertight edge counts do not certify absence of self-intersection.',
+                'Output is not a validated CFD-ready volume mesh.']}
     if graph.stats['radius_points_clamped']:
-        report['warnings'].append(f"Clamped {graph.stats['radius_points_clamped']} very small/invalid input radii")
+        report['warnings'].append('Some very small or invalid radii were clamped')
     if any(x['surface_triangles_labeled']==0 for x in cap_diag):
-        report['warnings'].append('Some named end caps have no labeled cells; increase grid resolution or inspect orientation')
-    if surface_quality['zero_area_triangles'] or surface_quality['duplicate_index_facets']:
-        report['warnings'].append('Final output contains degenerate or duplicated triangles')
-    if final_quality['connected_regions']!=1:
-        report['warnings'].append('Output has multiple disconnected surface regions')
-    if final_quality['boundary_edges'] or final_quality['nonmanifold_edges']:
-        report['warnings'].append('Final mesh is not a closed 2-manifold by edge count')
+        report['warnings'].append('Some named cap faces have zero triangles')
+    if final_topology['connected_regions']!=1:
+        report['warnings'].append('Union has multiple disconnected regions; check spacing and overlapping hulls')
+    if final_topology['boundary_edges'] or final_topology['nonmanifold_edges']:
+        report['warnings'].append('Output is not a closed two-manifold by edge counts')
     (output_dir/'reconstruction_report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
-    print('\nFinal surface:',path_out)
-    print('Final topology:',final_quality)
-    print('Surface QA:',surface_quality)
-    print('Caps:',len(cap_diag),' zero-labeled:',sum(x['zero_cells_warning'] for x in cap_diag))
-    print('Diagnostics:',output_dir)
+    print('\nFinal model:',path_out)
+    print('Final topology:',final_topology)
+    print('Caps:',len(cap_diag),'zero-labeled:',sum(x['zero_cells_warning'] for x in cap_diag))
     return path_out,report
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input',default=CENTERLINE_VTP,help='Trimmed centerlines VTP')
+    parser.add_argument('--input',default=CENTERLINE_VTP,
+                        help='Trimmed centerline VTP')
     parser.add_argument('--output-dir',default=OUTPUT_DIR)
-    parser.add_argument('--spacing',type=float,default=None,help='Override global voxel spacing')
+    parser.add_argument('--spacing',type=float,default=None)
     parser.add_argument('--circle-resolution',type=int,default=None)
     parser.add_argument('--radius-floor',type=float,default=None)
+    parser.add_argument('--stride',type=int,choices=[1,2],default=None,
+                        help='1: 123,234,345; 2: 123,345,...')
+    parser.add_argument('--resample-centerline',action='store_true',
+                        help='Add extra circles between distant original points')
     args=parser.parse_args()
     global VOXEL_SPACING,CIRCLE_RESOLUTION,RADIUS_FLOOR_ABSOLUTE
+    global THREE_RING_STRIDE,RESAMPLE_CENTERLINE
     if args.spacing is not None:
-        if args.spacing<=0:parser.error('--spacing must be positive')
+        if args.spacing<=0:parser.error('--spacing must be > 0')
         VOXEL_SPACING=args.spacing
     if args.circle_resolution is not None:
-        if args.circle_resolution<8:parser.error('circle resolution must be >=8')
+        if args.circle_resolution<8:parser.error('--circle-resolution must be >=8')
         CIRCLE_RESOLUTION=args.circle_resolution
     if args.radius_floor is not None:
-        if args.radius_floor<=0:parser.error('radius floor must be >0')
+        if args.radius_floor<=0:parser.error('--radius-floor must be >0')
         RADIUS_FLOOR_ABSOLUTE=args.radius_floor
+    if args.stride is not None:
+        THREE_RING_STRIDE=args.stride
+    if args.resample_centerline:
+        RESAMPLE_CENTERLINE=True
     reconstruct(args.input,args.output_dir)
 
 
