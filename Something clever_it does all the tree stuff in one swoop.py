@@ -4,9 +4,9 @@ import os
 centerlines_path = r"C:\Users\Admin\Documents\3D_Slicer_Files\JL_Testing\Network_model_V4.vtp"
 
 # ENDPOINT SELECTION: choose "Generations" or "Radius".
-ENDPOINT_METHOD = "Generations"
+ENDPOINT_METHOD = "Radius"
 GENERATION_THRESHOLD = 8
-RADIUS_THRESHOLD = 0.5  # Same length units as the Radius array (usually cm).
+RADIUS_THRESHOLD = 1  # Same length units as the Radius array (usually cm).
 
 method = ENDPOINT_METHOD.strip().lower()
 if method not in ("generations", "radius"):
@@ -305,6 +305,7 @@ else:
     radius_trim.Script = r"""
 import vtk
 import numpy as np
+import builtins as py_builtins  # Avoid ParaView shadowing Python sum/min/max
 from collections import deque
 
 RADIUS_THRESHOLD = __RADIUS_THRESHOLD__
@@ -419,6 +420,13 @@ result.GetCellData().CopyAllocate(src.GetCellData(), len(old_cell_ids))
 for new_cid, old_cid in enumerate(old_cell_ids):
     result.GetCellData().CopyData(src.GetCellData(), old_cid, new_cid)
 
+# Ensure the source data arrays are maintained through the compacted tree.
+# PointIds are optional provenance; downstream filters do not require them.
+if result.GetPointData().GetArray("Radius") is None:
+    raise RuntimeError("Radius trim lost its Radius array while copying PointData.")
+if result.GetPointData().GetArray("Generation") is None:
+    raise RuntimeError("Radius trim lost its Generation array while copying PointData.")
+
 # Refresh the outlets BEFORE PF3, so downstream code can immediately inspect
 # new radius-cut terminal points. PF3 recomputes the flags again as normal.
 deg = [0] * len(keep_ids)
@@ -447,7 +455,7 @@ print("Radius trim: threshold <= {}".format(RADIUS_THRESHOLD))
 print("Radius trim: kept {}/{} points, {} edges".format(
     len(keep_ids), n, len(old_cell_ids)))
 print("Radius trim: first-radius cutoff terminals {}, total outlets {}".format(
-    len(cut_points), sum(deg[new_id[old]] == 1 for old in keep_ids if old != root)))
+    len(cut_points), py_builtins.sum(deg[new_id[old]] == 1 for old in keep_ids if old != root)))
 print("Radius trim: original connected graph edges {}, unvisited/cut descendants {}".format(
     len(edge_cell), n-len(keep_ids)))
 
@@ -465,7 +473,7 @@ while q_all:
         if b not in seen_all:
             seen_all.add(b)
             q_all.append(b)
-reachable_edges = sum(len(adj[a] & seen_all) for a in seen_all) // 2
+reachable_edges = py_builtins.sum(len(adj[a] & seen_all) for a in seen_all) // 2
 if reachable_edges >= len(seen_all):
     print("WARNING: centerline contains cycle(s); pruning uses an inlet-rooted BFS spanning tree.")
 
@@ -502,13 +510,10 @@ output = self.GetOutput()
 # Deep copy input to output to preserve geometry and existing arrays
 output.DeepCopy(input)
 
-# Get 'CenterlineIds' from CellData
-id_array = input.GetPointData().GetArray("PointIds")
-if id_array is None:
-    raise RuntimeError("PointIds array not found in CellData.")
-
-ids = numpy_support.vtk_to_numpy(id_array)
-
+# The downstream filter operates on current centerline point IDs.
+# The original PointIds array is preserved when present, but it is not
+# required for connectivity, length, outlet detection, or sidedness.
+# In particular, no original IDs should be indexed by current cell IDs.
 
 # Build connectivity map from cells
 connectivity = {i: [] for i in range(input.GetNumberOfPoints())}
@@ -520,14 +525,6 @@ for cell_id in range(input.GetNumberOfCells()):
         p2 = cell.GetPointId(i + 1)
         connectivity[p1].append(p2)
         connectivity[p2].append(p1)
-
-# Map cell IDs to point IDs
-point_ids = np.full(input.GetNumberOfPoints(), -1)
-for cell_id in range(input.GetNumberOfCells()):
-    cell = input.GetCell(cell_id)
-    for i in range(cell.GetNumberOfPoints()):
-        pid = cell.GetPointId(i)
-        point_ids[pid] = ids[cell_id]
 
 # Find inlet from the preserved flag, rather than assuming that the
 # original PointIds still match current cell IDs after trimming.
